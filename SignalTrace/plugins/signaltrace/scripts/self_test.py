@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import json
 import pathlib
-import tempfile
+import concurrent.futures
+import time
 import unittest
 
 from analyzers import (
     content_engagement_audit, deduplicate_findings, destination_observation,
-    parse_page, structured_data_audit,
+    parse_page, source_verification, structured_data_audit,
 )
 from runtime import Evidence, RequestGovernor
 from scope import compare_scopes, normalize_scope
@@ -83,6 +84,17 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertIsInstance(merged[0]["evidence"], list)
 
+    def test_copied_external_sources_are_not_double_counted(self):
+        html = "<html><head><title>Publisher</title><link rel='canonical' href='https://wire.example/story'></head><body>" + \
+               ("Widget price is 20 USD. " * 10) + "</body></html>"
+        one = parse_page(html, "https://one.example/story")
+        two = parse_page(html, "https://two.example/copy")
+        _, unresolved = source_verification(
+            [{"entity": "Widget", "predicate": "price", "value": "20", "unit": "USD"}],
+            [("https://one.example/story", one), ("https://two.example/copy", two)],
+            "https://shop.example/widget")
+        self.assertTrue(any("duplicates" in item for item in unresolved))
+
 
 class RuntimeTests(unittest.TestCase):
     def test_robots_denial_prevents_page_request(self):
@@ -97,6 +109,22 @@ class RuntimeTests(unittest.TestCase):
         result = governor.fetch("https://example.com/private")
         self.assertEqual(result.outcome, "robots-denied")
         self.assertEqual(calls, ["https://example.com/robots.txt"])
+
+    def test_concurrent_same_origin_fetches_share_one_robots_request(self):
+        governor = RequestGovernor(max_requests=5, max_concurrency=2, timeout=1,
+                                   max_body_bytes=1000, deadline_seconds=3)
+        calls = []
+        def fake_request(url, body_limit=None):
+            calls.append(url)
+            if url.endswith("/robots.txt"):
+                time.sleep(.02)
+                return Evidence(url, url, 200, {"content-type": "text/plain"},
+                                b"User-agent: *\nAllow: /\n", [], "ok")
+            return Evidence(url, url, 200, {"content-type": "text/html"}, b"<p>ok</p>", [], "ok")
+        governor._request_once = fake_request  # type: ignore[method-assign]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(governor.fetch, ["https://example.com/a", "https://example.com/b"]))
+        self.assertEqual(calls.count("https://example.com/robots.txt"), 1)
 
 
 class PackageTests(unittest.TestCase):
