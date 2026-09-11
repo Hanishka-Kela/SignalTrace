@@ -319,12 +319,32 @@ def destination_observation(link: dict[str, str], source_url: str, evidence,
     return findings, unresolved
 
 
-def source_verification(claims: list[dict[str, Any]], source_pages: list[tuple[str, PageParser]]) -> tuple[list[dict], list[str]]:
+def source_verification(claims: list[dict[str, Any]], source_pages: list[tuple[str, PageParser]],
+                        target_url: str | None = None) -> tuple[list[dict], list[str]]:
     findings, unresolved = [], []
     if not source_pages:
         return [], ["source-verification: not assessed; no suitable independent source was supplied and fetched"]
+    independent = []
+    fingerprints: set[str] = set()
+    target_origin = urllib.parse.urlsplit(target_url).netloc.casefold() if target_url else None
+    for source_url, page in source_pages:
+        if target_origin and urllib.parse.urlsplit(source_url).netloc.casefold() == target_origin:
+            unresolved.append(f"source-verification: {source_url} is first-party, not an independent source")
+            continue
+        identity = (page.canonicals[0] if page.canonicals else source_url).casefold()
+        fingerprint = hashlib.sha256(page.visible_text.casefold().encode()).hexdigest()
+        marker = identity + "|" + fingerprint
+        if marker in fingerprints:
+            unresolved.append(f"source-verification: {source_url} duplicates an observed canonical/feed copy and is not independent")
+            continue
+        fingerprints.add(marker)
+        independent.append((source_url, page))
+    if not independent:
+        unresolved.append("source-verification: not assessed; no suitable independent source remained")
+        return findings, unresolved
     if not claims:
-        return [], ["source-verification: sources fetched but no scoped claims were supplied for deterministic comparison"]
+        unresolved.append("source-verification: sources fetched but no scoped claims were supplied for deterministic comparison")
+        return findings, unresolved
     for claim in claims:
         scoped = normalize_scope(claim)
         if not scoped["entity"] or not scoped["predicate"] or scoped["value"] is None:
@@ -332,7 +352,7 @@ def source_verification(claims: list[dict[str, Any]], source_pages: list[tuple[s
             continue
         candidates = []
         needle = str(claim.get("value", ""))
-        for source_url, page in source_pages:
+        for source_url, page in independent:
             if needle and needle.casefold() in page.visible_text.casefold():
                 candidates.append(source_url)
         if not candidates:

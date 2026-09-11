@@ -122,7 +122,14 @@ def _fetch_source(governor: RequestGovernor, url: str):
         return None, f"source-verification: {url} restricted by robots; not assessed"
     if evidence.status != 200 or not _is_html(evidence):
         return None, f"source-verification: {url} has no usable public HTML evidence"
-    return (evidence.final_url, parse_page(evidence.text(), evidence.final_url)), None
+    page = parse_page(evidence.text(), evidence.final_url)
+    words = len(page.visible_text.split())
+    if words < 12:
+        state = "placeholder, locked, or image-only" if page.images or page.controls else "insufficient"
+        return None, f"source-verification: {url} has {state} evidence; not assessed"
+    if not (page.title or any(h["level"] == "h1" and h["text"] for h in page.headings)):
+        return None, f"source-verification: {url} has ambiguous source identity; not assessed"
+    return (evidence.final_url, page), None
 
 
 def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -238,7 +245,7 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
                     unresolved.append(note)
             except Exception as exc:
                 unresolved.append(f"source-verification: fetch did not complete: {exc}")
-    found, notes = source_verification(payload.get("claims", []), source_pages)
+    found, notes = source_verification(payload.get("claims", []), source_pages, target.final_url)
     findings.extend(found)
     unresolved.extend(notes)
     completed.append("source-verification")

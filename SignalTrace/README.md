@@ -56,7 +56,7 @@ The CLI accepts either a positional URL or one stdin JSON object:
 - `sources` (optional): targeted external evidence URLs.
 - `claims` (optional): scoped claim objects using the fields in `references/audit-contract.md`.
 
-CLI options override the default resource limits. Exit code `0` means a valid audit report was emitted, including reports where access was denied. Exit code `2` is reserved for invalid input, for which no audit JSON can be constructed.
+CLI options override the default resource limits. Exit code `0` means a valid audit report was emitted, including reports where access was denied or the URL is outside the supported public HTTP(S) scope. Exit code `2` is reserved for a missing or malformed input envelope, for which no audit JSON can be constructed.
 
 ## Validate
 

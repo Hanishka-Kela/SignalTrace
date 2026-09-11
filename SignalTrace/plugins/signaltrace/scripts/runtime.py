@@ -69,6 +69,7 @@ class RequestGovernor:
         self._skipped = 0
         self._cache: dict[str, Evidence] = {}
         self._robots: dict[str, tuple[bool, urllib.robotparser.RobotFileParser | None, str]] = {}
+        self._robots_inflight: dict[str, threading.Event] = {}
         self._inflight: dict[str, threading.Event] = {}
         self._opener = urllib.request.build_opener(_NoRedirect())
 
@@ -171,8 +172,20 @@ class RequestGovernor:
         origin = self._origin(url)
         with self._lock:
             known = self._robots.get(origin)
-        if known:
-            return known
+            if known:
+                return known
+            wait_event = self._robots_inflight.get(origin)
+            if wait_event is None:
+                wait_event = threading.Event()
+                self._robots_inflight[origin] = wait_event
+                owner = True
+            else:
+                owner = False
+        if not owner:
+            wait_event.wait(timeout=self.remaining_seconds())
+            with self._lock:
+                return self._robots.get(
+                    origin, (False, None, "robots check did not complete before deadline"))
         robots_url = origin + "/robots.txt"
         try:
             result = self._request_once(robots_url, body_limit=min(self.max_body_bytes, 262144))
@@ -194,6 +207,8 @@ class RequestGovernor:
                     policy = (False, None, f"robots parse failure: {exc}")
         with self._lock:
             self._robots.setdefault(origin, policy)
+            self._robots_inflight.pop(origin, None)
+            wait_event.set()
             return self._robots[origin]
 
     def permission(self, url: str) -> tuple[bool, str]:
@@ -261,8 +276,8 @@ class RequestGovernor:
                 result = Evidence(requested, current, None, {}, b"", chain,
                                   "redirect-limit", "redirect limit exceeded")
             with self._lock:
-                self._cache[requested] = result
-                self._cache.setdefault(result.final_url, result)
+                for alias in seen:
+                    self._cache.setdefault(alias, result)
             return result
         finally:
             with self._lock:
