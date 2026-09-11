@@ -1,0 +1,6 @@
+interface:
+  display_name: "SignalTrace Website Audit"
+  short_description: "Audit AI evidence paths on a public website"
+  default_prompt: "Use $audit-entrypoint to audit this public website and return one JSON report."
+policy:
+  allow_implicit_invocation: true

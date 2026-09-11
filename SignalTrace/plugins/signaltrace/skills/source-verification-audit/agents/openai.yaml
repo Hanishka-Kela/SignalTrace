@@ -1,0 +1,6 @@
+interface:
+  display_name: "Source Verification Audit"
+  short_description: "Verify scoped claims against named sources"
+  default_prompt: "Use $source-verification-audit for these explicit claims and sources."
+policy:
+  allow_implicit_invocation: false

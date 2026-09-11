@@ -1,0 +1,20 @@
+{
+  "name": "signaltrace-marketplace",
+  "interface": {
+    "displayName": "SignalTrace"
+  },
+  "plugins": [
+    {
+      "name": "signaltrace",
+      "source": {
+        "source": "local",
+        "path": "./plugins/signaltrace"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

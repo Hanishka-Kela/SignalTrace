@@ -1,0 +1,6 @@
+interface:
+  display_name: "Citation Destination Audit"
+  short_description: "Trace claim-to-destination support"
+  default_prompt: "Use $citation-destination-audit to trace these bounded cached citations."
+policy:
+  allow_implicit_invocation: false

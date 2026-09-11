@@ -1,0 +1,6 @@
+interface:
+  display_name: "Content Engagement Audit"
+  short_description: "Inspect answer and continuation evidence"
+  default_prompt: "Use $content-engagement-audit on cached initial HTML evidence."
+policy:
+  allow_implicit_invocation: false

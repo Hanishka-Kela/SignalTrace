@@ -1,0 +1,6 @@
+interface:
+  display_name: "Structured Data Audit"
+  short_description: "Inspect scoped structured-data evidence"
+  default_prompt: "Use $structured-data-audit on the cached SignalTrace evidence."
+policy:
+  allow_implicit_invocation: false
