@@ -18,10 +18,10 @@ from analyzers import (
     parse_page, same_as_declarations, same_as_destination_observation,
     source_verification, structured_data_audit, visitor_journey_audit,
 )
-from runtime import Evidence, LimitError, RequestGovernor
+from runtime import Evidence, LimitError, RequestGovernor, RobotsDecision
 from config import DEFAULTS, USER_AGENT
 from scope import compare_scopes, normalize_scope
-from signaltrace import _audit_same_as, _select_journey_links
+from signaltrace import _audit_same_as, _journey_sample_limit, _report, _select_journey_links
 
 
 class ScopeTests(unittest.TestCase):
@@ -557,8 +557,132 @@ class RuntimeTests(unittest.TestCase):
         governor._request_with_retries = fake_request  # type: ignore[method-assign]
         result = governor.fetch("https://example.com/a")
         self.assertEqual(result.status, 200)
-        self.assertEqual(governor.robots_result(result.final_url)["result"], "http-error")
+        self.assertEqual(governor.robots_result(result.final_url)["result"], "unavailable")
         self.assertEqual(calls, ["https://example.com/robots.txt", "https://example.com/a"])
+
+    def test_missing_robots_404_continues_bounded_sample_with_exact_coverage(self):
+        governor = RequestGovernor(max_requests=8, max_concurrency=1, timeout=1,
+                                   max_body_bytes=1000, deadline_seconds=3, max_per_origin=8,
+                                   spacing_seconds=0)
+        calls = []
+        def fake_request(url, *, kind, body_limit):
+            calls.append(url)
+            if url.endswith("/robots.txt"):
+                return Evidence(url, url, 404, {}, b"", [], "http-error", "HTTP 404")
+            return Evidence(url, url, 200, {"content-type": "text/html"}, b"<p>Public</p>", [], "ok")
+        governor._request_with_retries = fake_request  # type: ignore[method-assign]
+        first = governor.fetch("https://example.com/a")
+        second = governor.fetch("https://example.com/b")
+        self.assertEqual((first.status, second.status), (200, 200))
+        self.assertEqual(calls, ["https://example.com/robots.txt",
+                                 "https://example.com/a", "https://example.com/b"])
+        self.assertEqual(governor.robots_result(first.final_url), {
+            "result": "missing", "detail": "missing: robots.txt returned HTTP 404"})
+        report = _report("https://example.com/a", governor, [], [], [])
+        self.assertEqual(report["coverage"]["crawl_policy"], {
+            "name": "bounded_missing-policy_audit", "unrestricted": False,
+            "reason": "No published robots policy was found; existing safety ceilings remain active"})
+        serialized = json.dumps(report["coverage"]).casefold()
+        self.assertNotIn("full permission", serialized)
+        self.assertNotIn("authorization to crawl", serialized)
+
+    def test_missing_robots_does_not_enable_recursive_selection(self):
+        page = parse_page("".join(
+            f"<a href='/product/{index}'>Product {index}</a>" for index in range(20)),
+            "https://example.com/")
+        selected, skipped = _select_journey_links(page, page.base_url, 5)
+        self.assertLessEqual(len(selected), 5)
+        self.assertTrue(skipped)
+        self.assertEqual(_journey_sample_limit({"result": "missing"}, 5), 5)
+        self.assertEqual(_journey_sample_limit({"result": "unavailable"}, 5), 1)
+        governor = RequestGovernor(spacing_seconds=0)
+        governor._robots["https://example.com"] = RobotsDecision(
+            "missing", True, "robots.txt returned HTTP 404")
+        self.assertIs(governor.crawl_policy(page.base_url)["unrestricted"], False)
+
+    def test_unavailable_robots_uses_conservative_origin_ceiling(self):
+        for robots_evidence in (
+            Evidence("", "", None, {}, b"", [], "timeout", "curl timed out"),
+            Evidence("", "", 503, {}, b"", [], "http-error", "HTTP 503"),
+        ):
+            with self.subTest(outcome=robots_evidence.outcome, status=robots_evidence.status):
+                governor = RequestGovernor(max_requests=8, max_concurrency=1, timeout=1,
+                                           max_body_bytes=1000, deadline_seconds=3,
+                                           max_per_origin=8, spacing_seconds=0)
+                calls = []
+                def fake_curl(url, *, kind, body_limit):
+                    _, reserved = governor._reserve(url, kind, body_limit)
+                    calls.append(url)
+                    governor._completed += 1
+                    governor._aggregate_reserved -= reserved
+                    if url.endswith("/robots.txt"):
+                        return Evidence(url, url, robots_evidence.status, {}, b"", [],
+                                        robots_evidence.outcome, robots_evidence.detail)
+                    return Evidence(url, url, 200, {"content-type": "text/html"},
+                                    b"<p>Public</p>", [], "ok")
+                governor._curl_once = fake_curl  # type: ignore[method-assign]
+                governor.fetch("https://example.com/a")
+                governor.fetch("https://example.com/b")
+                with self.assertRaisesRegex(LimitError, "conservative origin ceiling"):
+                    governor.fetch("https://example.com/c")
+                self.assertEqual(governor.robots_result("https://example.com/a")["result"],
+                                 "unavailable")
+                policy = governor.crawl_policy("https://example.com/a")
+                self.assertEqual(policy["name"], "conservative_unavailable-policy_audit")
+                self.assertIs(policy["unrestricted"], False)
+
+    def test_403_and_429_stop_further_origin_requests(self):
+        for status in (403, 429):
+            with self.subTest(status=status):
+                governor = RequestGovernor(max_requests=8, max_concurrency=1, timeout=1,
+                                           max_body_bytes=1000, deadline_seconds=3,
+                                           max_per_origin=8, spacing_seconds=0)
+                calls = []
+                def fake_request(url, *, kind, body_limit):
+                    calls.append(url)
+                    if url.endswith("/robots.txt"):
+                        return Evidence(url, url, 200, {}, b"User-agent: *\nAllow: /\n", [], "ok")
+                    return Evidence(url, url, status, {}, b"Access denied", [],
+                                    "http-error", f"HTTP {status}")
+                governor._request_with_retries = fake_request  # type: ignore[method-assign]
+                first = governor.fetch("https://example.com/a")
+                second = governor.fetch("https://example.com/b")
+                self.assertEqual(first.outcome, "blocked")
+                self.assertEqual(second.outcome, "origin-blocked")
+                self.assertEqual(calls, ["https://example.com/robots.txt", "https://example.com/a"])
+
+    def test_repeated_5xx_and_explicit_antibot_stop_origin(self):
+        governor = RequestGovernor(max_requests=8, max_concurrency=1, timeout=1,
+                                   max_body_bytes=1000, deadline_seconds=3,
+                                   max_per_origin=8, spacing_seconds=0)
+        statuses = iter((500, 502))
+        calls = []
+        def fake_request(url, *, kind, body_limit):
+            calls.append(url)
+            if url.endswith("/robots.txt"):
+                return Evidence(url, url, 200, {}, b"User-agent: *\nAllow: /\n", [], "ok")
+            status = next(statuses)
+            return Evidence(url, url, status, {}, b"Server error", [], "http-error", f"HTTP {status}")
+        governor._request_with_retries = fake_request  # type: ignore[method-assign]
+        self.assertEqual(governor.fetch("https://example.com/a").outcome, "http-error")
+        self.assertEqual(governor.fetch("https://example.com/b").outcome, "blocked")
+        self.assertEqual(governor.fetch("https://example.com/c").outcome, "origin-blocked")
+        self.assertEqual(len(calls), 3)
+
+        challenged = RequestGovernor(max_requests=4, max_concurrency=1, timeout=1,
+                                     max_body_bytes=1000, deadline_seconds=3,
+                                     max_per_origin=4, spacing_seconds=0)
+        challenge_calls = []
+        def fake_challenge(url, *, kind, body_limit):
+            challenge_calls.append(url)
+            if url.endswith("/robots.txt"):
+                return Evidence(url, url, 200, {}, b"User-agent: *\nAllow: /\n", [], "ok")
+            return Evidence(url, url, 200, {"content-type": "text/html"},
+                            b"<h1>Verify you are human</h1>", [], "ok")
+        challenged._request_with_retries = fake_challenge  # type: ignore[method-assign]
+        self.assertEqual(challenged.fetch("https://example.com/a").outcome, "blocked")
+        self.assertEqual(challenged.fetch("https://example.com/b").outcome, "origin-blocked")
+        self.assertEqual(len(challenge_calls), 2)
 
     def test_request_ceiling_spacing_and_deadline_are_preserved(self):
         governor = RequestGovernor(max_requests=2, target_request_maximum=2, max_concurrency=2,
@@ -584,7 +708,7 @@ class RuntimeTests(unittest.TestCase):
         expired = RequestGovernor(deadline_seconds=.001, spacing_seconds=0)
         time.sleep(.003)
         result = expired.fetch("https://example.com/a")
-        self.assertEqual(result.outcome, "robots-denied")
+        self.assertEqual(result.outcome, "unavailable")
         self.assertEqual(expired.snapshot()["requests_started"], 0)
 
 

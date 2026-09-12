@@ -22,6 +22,7 @@ class Limits:
     robots_body_limit_bytes: int = 256 * 1024
     selected_link_maximum: int = 5
     skipped_link_evidence_maximum: int = 50
+    unavailable_robots_origin_target_maximum: int = 2
 
 
 DEFAULTS = Limits()

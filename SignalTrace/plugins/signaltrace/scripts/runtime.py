@@ -42,6 +42,7 @@ class Evidence:
     detail: str = ""
     curl_exit: int | None = None
     cache_key: str = ""
+    policy_observed: bool = False
 
     def text(self) -> str:
         content_type = self.headers.get("content-type", "")
@@ -103,8 +104,11 @@ class RequestGovernor:
         self._aggregate_bytes = 0
         self._aggregate_reserved = 0
         self._origin_started: dict[str, int] = {}
+        self._origin_target_started: dict[str, int] = {}
         self._origin_locks: dict[str, threading.Lock] = {}
         self._origin_last_start: dict[str, float] = {}
+        self._origin_server_failures: dict[str, int] = {}
+        self._blocked_origins: dict[str, str] = {}
         self._cache: dict[str, Evidence] = {}
         self._response_cache: dict[str, list[Evidence]] = {}
         self._robots: dict[str, RobotsDecision] = {}
@@ -132,6 +136,10 @@ class RequestGovernor:
                 "remaining_target_requests": max(0, self.target_request_maximum - self._target_started),
                 "remaining_deadline_seconds": round(self.remaining_seconds(), 3),
                 "elapsed_seconds": round(self.elapsed_seconds(), 3),
+                "origins_stopped": [
+                    {"origin": origin, "reason": reason}
+                    for origin, reason in sorted(self._blocked_origins.items())
+                ],
             }
             if url:
                 origin = self._origin(self.normalize_url(url))
@@ -204,7 +212,14 @@ class RequestGovernor:
             if self._origin_started.get(origin, 0) >= self.max_per_origin:
                 self._skipped += 1
                 raise LimitError("per-origin request ceiling reached")
-            if kind != "robots" and self._target_started >= self.target_request_maximum:
+            decision = self._robots.get(origin)
+            is_robots_request = kind.startswith("robots")
+            if (not is_robots_request and decision is not None and decision.result == "unavailable"
+                    and self._origin_target_started.get(origin, 0) >=
+                    DEFAULTS.unavailable_robots_origin_target_maximum):
+                self._skipped += 1
+                raise LimitError("unavailable robots policy conservative origin ceiling reached")
+            if not is_robots_request and self._target_started >= self.target_request_maximum:
                 self._skipped += 1
                 raise LimitError("target request ceiling reached")
             aggregate_remaining = self.aggregate_body_bytes - self._aggregate_bytes - self._aggregate_reserved
@@ -213,9 +228,10 @@ class RequestGovernor:
                 raise LimitError("aggregate response body ceiling reached")
             self._started += 1
             self._origin_started[origin] = self._origin_started.get(origin, 0) + 1
-            if kind != "robots":
+            if not is_robots_request:
                 self._target_started += 1
-            if kind == "retry":
+                self._origin_target_started[origin] = self._origin_target_started.get(origin, 0) + 1
+            if kind in {"retry", "robots-retry"}:
                 self._retries_started += 1
             reserved = max(1, min(requested_body_bytes, aggregate_remaining))
             self._aggregate_reserved += reserved
@@ -262,6 +278,45 @@ class RequestGovernor:
             self._response_cache.setdefault(url, []).append(result)
         return result
 
+    def _blocked_evidence(self, url: str, reason: str) -> Evidence:
+        with self._lock:
+            self._skipped += 1
+        return Evidence(url, url, None, {}, b"", [], "origin-blocked", reason,
+                        policy_observed=True)
+
+    def _observe_origin_response(self, url: str, evidence: Evidence, kind: str) -> None:
+        """Stop an origin after explicit access controls or repeated server failures."""
+        if kind.startswith("robots") or evidence.policy_observed:
+            return
+        evidence.policy_observed = True
+        origin = self._origin(url)
+        body = evidence.body[:16384].decode("utf-8", errors="ignore")
+        anti_bot = bool(re.search(
+            r"\b(?:verify you are human|checking your browser|automated (?:access|requests?) "
+            r"(?:is |are )?(?:blocked|denied)|request blocked by security policy)\b",
+            body, re.I)) or evidence.headers.get("cf-mitigated", "").casefold() == "challenge"
+        anti_bot = anti_bot or bool(len(evidence.body) <= 65536 and re.search(
+            r"<title[^>]*>[^<]*(?:captcha|human verification)[^<]*</title>|\bcaptcha challenge\b",
+            body, re.I))
+        reason = ""
+        with self._lock:
+            if evidence.status in {403, 429}:
+                reason = f"origin stopped after HTTP {evidence.status} access response"
+            elif anti_bot:
+                reason = "origin stopped after an explicit anti-bot response"
+            elif evidence.status is not None and 500 <= evidence.status <= 599:
+                failures = self._origin_server_failures.get(origin, 0) + 1
+                self._origin_server_failures[origin] = failures
+                if failures >= 2:
+                    reason = f"origin stopped after repeated 5xx responses (latest HTTP {evidence.status})"
+            elif evidence.status is not None:
+                self._origin_server_failures[origin] = 0
+            if reason:
+                self._blocked_origins[origin] = reason
+        if reason:
+            evidence.outcome = "blocked"
+            evidence.detail = reason
+
     def _curl_once(self, url: str, *, kind: str, body_limit: int) -> Evidence:
         if not self._curl_path:
             return Evidence(url, url, None, {}, b"", [], "network-error", "curl executable not found")
@@ -269,6 +324,10 @@ class RequestGovernor:
         with self._lock:
             origin_lock = self._origin_locks.setdefault(origin, threading.Lock())
         with origin_lock:
+            with self._lock:
+                blocked_reason = self._blocked_origins.get(origin)
+            if not kind.startswith("robots") and blocked_reason:
+                return self._blocked_evidence(url, blocked_reason)
             self._spacing_wait(origin)
             timeout, effective_limit = self._reserve(url, kind, body_limit)
             with self._lock:
@@ -336,6 +395,7 @@ class RequestGovernor:
                 else:
                     outcome, detail = "http-error", f"HTTP {status}"
                 result = Evidence(url, effective_url, status, headers, body, [], outcome, detail, process.returncode)
+            self._observe_origin_response(url, result, kind)
             return self._remember_response(url, result)
 
     def _request_with_retries(self, url: str, *, kind: str, body_limit: int) -> Evidence:
@@ -345,7 +405,8 @@ class RequestGovernor:
                 result.status is not None and result.status >= 500)
             if not retryable or self.remaining_seconds() <= 0:
                 break
-            result = self._curl_once(url, kind="retry", body_limit=body_limit)
+            retry_kind = "robots-retry" if kind.startswith("robots") else "retry"
+            result = self._curl_once(url, kind=retry_kind, body_limit=body_limit)
         return result
 
     def _load_robots(self, url: str) -> RobotsDecision:
@@ -365,7 +426,7 @@ class RequestGovernor:
             event.wait(timeout=self.remaining_seconds())
             with self._lock:
                 return self._robots.get(origin, RobotsDecision(
-                    "unreachable", False, "robots check did not complete before deadline"))
+                    "unavailable", False, "robots check did not complete before deadline"))
         robots_url = origin + "/robots.txt"
         try:
             evidence = self._request_with_retries(
@@ -374,20 +435,20 @@ class RequestGovernor:
                 decision = RobotsDecision("missing", True, f"robots.txt returned HTTP {evidence.status}")
             elif evidence.outcome == "timeout":
                 decision = RobotsDecision(
-                    "timeout", True,
-                    f"no usable robots policy was obtained ({evidence.detail}); bounded audit only")
+                    "unavailable", True,
+                    f"robots.txt timed out ({evidence.detail}); conservative bounded audit only")
             elif evidence.status is None or evidence.outcome == "network-error":
                 decision = RobotsDecision(
-                    "unreachable", True,
-                    f"no usable robots policy was obtained ({evidence.detail}); bounded audit only")
+                    "unavailable", True,
+                    f"robots.txt could not be fetched ({evidence.detail}); conservative bounded audit only")
             elif evidence.status != 200:
                 decision = RobotsDecision(
-                    "http-error", True,
-                    f"no usable robots policy was obtained (HTTP {evidence.status}); bounded audit only")
+                    "unavailable", True,
+                    f"robots.txt returned HTTP {evidence.status}; conservative bounded audit only")
             elif evidence.outcome == "body-limit" or b"\x00" in evidence.body:
                 decision = RobotsDecision(
-                    "parser-error", True,
-                    "no usable robots policy was obtained (truncated or invalid bytes); bounded audit only")
+                    "unavailable", True,
+                    "robots.txt could not be parsed (truncated or invalid bytes); conservative bounded audit only")
             else:
                 try:
                     text = evidence.body.decode("utf-8", errors="strict")
@@ -397,14 +458,14 @@ class RequestGovernor:
                     decision = RobotsDecision("allowed", True, "robots.txt parsed", parser)
                 except (UnicodeDecodeError, ValueError) as exc:
                     decision = RobotsDecision(
-                        "parser-error", True,
-                        f"no usable robots policy was obtained ({exc}); bounded audit only")
+                        "unavailable", True,
+                        f"robots.txt could not be parsed ({exc}); conservative bounded audit only")
         except (LimitError, UnsafeTarget) as exc:
-            decision = RobotsDecision("unreachable", False, str(exc))
+            decision = RobotsDecision("unavailable", False, str(exc))
         finally:
             with self._lock:
                 if "decision" not in locals():
-                    decision = RobotsDecision("unreachable", False, "robots check failed")
+                    decision = RobotsDecision("unavailable", False, "robots check failed")
                 self._robots.setdefault(origin, decision)
                 self._robots_inflight.pop(origin, None)
                 event.set()
@@ -427,6 +488,33 @@ class RequestGovernor:
         allowed, reason = self.permission(normalized)
         result = decision.result if allowed else ("denied" if reason.startswith("denied:") else decision.result)
         return {"result": result, "detail": reason}
+
+    def crawl_policy(self, url: str) -> dict[str, Any]:
+        """Describe the bounded scheduling policy without implying authorization."""
+        robots = self.robots_result(url)
+        if robots["result"] == "missing":
+            return {
+                "name": "bounded_missing-policy_audit",
+                "unrestricted": False,
+                "reason": "No published robots policy was found; existing safety ceilings remain active",
+            }
+        if robots["result"] == "unavailable":
+            return {
+                "name": "conservative_unavailable-policy_audit",
+                "unrestricted": False,
+                "reason": "No usable robots policy could be obtained; a reduced sample and all safety ceilings remain active",
+            }
+        if robots["result"] == "denied":
+            return {
+                "name": "robots-denied",
+                "unrestricted": False,
+                "reason": "robots.txt denied this URL; it is not assessed",
+            }
+        return {
+            "name": "bounded_published-policy_audit",
+            "unrestricted": False,
+            "reason": "Published robots rules and all existing safety ceilings remain active",
+        }
 
     def fetch(self, url: str) -> Evidence:
         requested = self.normalize_url(url)
@@ -455,10 +543,20 @@ class RequestGovernor:
                 if not allowed:
                     with self._lock:
                         self._skipped += 1
-                    result = Evidence(requested, current, None, {}, b"", chain, "robots-denied", reason)
+                    outcome = "robots-denied" if reason.startswith("denied:") else "unavailable"
+                    result = Evidence(requested, current, None, {}, b"", chain, outcome, reason)
+                    break
+                with self._lock:
+                    blocked_reason = self._blocked_origins.get(self._origin(current))
+                if blocked_reason:
+                    result = self._blocked_evidence(current, blocked_reason)
+                    result.requested_url = requested
+                    result.redirect_chain = list(chain)
                     break
                 evidence = self._request_with_retries(
                     current, kind="target" if hop == 0 else "redirect", body_limit=self.max_body_bytes)
+                self._observe_origin_response(
+                    current, evidence, "target" if hop == 0 else "redirect")
                 evidence.requested_url = requested
                 evidence.redirect_chain = list(chain)
                 if evidence.status not in REDIRECTS:

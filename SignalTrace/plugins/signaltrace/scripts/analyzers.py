@@ -1445,6 +1445,11 @@ def same_as_destination_observation(declaration: dict[str, Any], source_url: str
         result["classification"] = "robots-denied"
         unresolved.append(f"sameAs-identity: {declared_url} denied by robots.txt; not assessed")
         return findings, unresolved, result
+    if evidence.outcome in {"blocked", "origin-blocked"} or evidence.status in {403, 429}:
+        result["classification"] = "blocked"
+        unresolved.append(
+            f"sameAs-identity: {declared_url} was blocked or unavailable ({evidence.detail}); not assessed")
+        return findings, unresolved, result
 
     dead_outcomes = {"unresolved-redirect", "redirect-loop", "redirect-limit"}
     is_http_dead = evidence.status is not None and evidence.status >= 400
@@ -1556,6 +1561,10 @@ def destination_observation(link: dict[str, str], source_url: str, evidence,
     findings, unresolved = [], []
     context = link.get("text", "").strip()
     responsibility = "site-published link"
+    if evidence.outcome in {"blocked", "origin-blocked"} or evidence.status in {403, 429}:
+        unresolved.append(
+            f"citation-destination: {link['url']} blocked or unavailable ({evidence.detail}); not assessed")
+        return findings, unresolved
     if evidence.outcome in {"network-error", "unresolved-redirect", "redirect-loop", "redirect-limit"} or \
             (evidence.status is not None and evidence.status >= 400):
         findings.append(finding(

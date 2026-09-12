@@ -153,6 +153,12 @@ def _select_journey_links(page, target_url: str, limit: int) -> tuple[list[dict[
     return selected, skipped[:DEFAULTS.skipped_link_evidence_maximum]
 
 
+def _journey_sample_limit(robots_result: dict[str, str], requested_limit: int) -> int:
+    """Reduce, never expand, the sample when no usable robots policy was fetched."""
+    requested_limit = max(0, requested_limit)
+    return min(1, requested_limit) if robots_result.get("result") == "unavailable" else requested_limit
+
+
 def _explicit_citations(payload: dict[str, Any], base: str) -> list[dict[str, str]]:
     results = []
     for item in payload.get("citations", []):
@@ -230,6 +236,11 @@ def _fetch_journey(governor: RequestGovernor, source_url: str,
         record["unresolved"].append(
             f"visitor-journey: {link['url']} restricted by robots.txt; not fetched")
         return record
+    if evidence.outcome in {"blocked", "origin-blocked"} or evidence.status in {403, 429}:
+        record["skipped"] = evidence.detail or "origin blocked or unavailable"
+        record["unresolved"].append(
+            f"visitor-journey: {link['url']} blocked or unavailable; not assessed")
+        return record
     if evidence.outcome == "body-limit":
         record["unresolved"].append(
             f"visitor-journey: {link['url']} exceeded the body limit; partial evidence only")
@@ -253,6 +264,8 @@ def _fetch_source(governor: RequestGovernor, url: str):
         return None, f"source-verification: {url} not assessed: {exc}"
     if evidence.outcome == "robots-denied":
         return None, f"source-verification: {url} restricted by robots; not assessed"
+    if evidence.outcome in {"blocked", "origin-blocked"} or evidence.status in {403, 429}:
+        return None, f"source-verification: {url} blocked or unavailable; not assessed"
     if evidence.outcome == "body-limit":
         return None, f"source-verification: {url} exceeded the response body limit; not assessed"
     if evidence.status != 200 or not _is_html(evidence):
@@ -315,6 +328,16 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             "source-verification: not assessed because the primary target was unavailable",
         ])
         return _report(site, governor, findings, completed, unresolved)
+    if target.outcome in {"blocked", "origin-blocked"} or target.status in {403, 429}:
+        unresolved.extend([
+            f"target-fetch: blocked or unavailable: {target.detail or ('HTTP ' + str(target.status))}",
+            "structured-data: not assessed without usable target HTML",
+            "content-engagement: not assessed without usable target HTML",
+            "citation-destination: not assessed without usable target HTML",
+            "sameAs-identity: not assessed without usable target HTML",
+            "source-verification: primary target blocked or unavailable",
+        ])
+        return _report(site, governor, findings, completed, unresolved)
     if target.status is None:
         unresolved.extend([
             f"target-fetch: unresolved network state: {target.detail}",
@@ -367,7 +390,8 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             f"robots-policy: {robots_result.get('result')}: {robots_result.get('detail')}; "
             "only the governor's permitted bounded behavior can continue")
     citations = _explicit_citations(payload, target.final_url)[:max(0, args.max_link_checks)]
-    journey_links, skipped_links = _select_journey_links(page, target.final_url, args.max_link_checks)
+    journey_limit = _journey_sample_limit(robots_result, args.max_link_checks)
+    journey_links, skipped_links = _select_journey_links(page, target.final_url, journey_limit)
     journey_coverage["selected_links"] = [
         {"url": item["url"], "role": item.get("role", "other"),
          "label": item.get("text", "")} for item in journey_links]
@@ -491,8 +515,13 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
     snapshot = governor.snapshot()
     try:
         robots_result = governor.robots_result(site)
+        crawl_policy = governor.crawl_policy(site)
     except (UnsafeTarget, ValueError):
         robots_result = {"result": "not-checked", "detail": "invalid or unsupported target URL"}
+        crawl_policy = {
+            "name": "not-checked", "unrestricted": False,
+            "reason": "No supported public target was available; no crawling was authorized",
+        }
     return {
         "site": site,
         "audited_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
@@ -510,6 +539,8 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
             "response_bytes_cached": snapshot["response_bytes_cached"],
             "elapsed_seconds": snapshot["elapsed_seconds"],
             "robots_result": robots_result,
+            "crawl_policy": crawl_policy,
+            "origins_stopped": snapshot["origins_stopped"],
             "subagent_facility_available": False,
             "execution_mode": "local",
             "checks_completed": [name for name in CHECKS if name in set(completed)],
