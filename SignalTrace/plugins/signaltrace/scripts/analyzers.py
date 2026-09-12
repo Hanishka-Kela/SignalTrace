@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import urllib.parse
+from copy import deepcopy
 from html.parser import HTMLParser
 from typing import Any, Iterable
 
@@ -36,24 +37,32 @@ def finding(*, code: str, title: str, severity: str, confidence: float,
         "suggested_action": suggested_action,
         "priority": priority,
         "coverage_status": coverage_status,
+        "is_finding": True,
         "_code": code,
     }
 
 
 def opportunity(*, rule_id: str, priority: str, category: str, action: str,
-                reason: str, url: str, source: str, observed: str,
-                confidence: str) -> dict[str, Any]:
+                reason: str, url: str, source: str, observed: Any,
+                confidence: str, page_role: str | None = None) -> dict[str, Any]:
     """Build a non-finding recommendation from a concrete cached observation."""
-    return {
+    item = {
         "id": rule_id,
         "priority": priority,
         "category": category,
         "action": action,
         "reason": reason,
-        "evidence": {"url": url, "source": source, "observed": compact(observed)},
+        "evidence": {
+            "url": url,
+            "source": source,
+            "observed": compact(observed) if isinstance(observed, str) else observed,
+        },
         "confidence": confidence,
         "is_finding": False,
     }
+    if page_role:
+        item["page_role"] = page_role
+    return item
 
 
 class PageParser(HTMLParser):
@@ -69,9 +78,10 @@ class PageParser(HTMLParser):
         self.links: list[dict[str, str]] = []
         self.headings: list[dict[str, str]] = []
         self.images: list[dict[str, str]] = []
-        self.controls: list[dict[str, str]] = []
+        self.controls: list[dict[str, Any]] = []
         self.forms: list[dict[str, Any]] = []
         self.labels: dict[str, str] = {}
+        self.element_text_by_id: dict[str, str] = {}
         self.jsonld: list[str] = []
         self.microdata = 0
         self.rdfa = 0
@@ -95,9 +105,11 @@ class PageParser(HTMLParser):
             "tag": tag,
             "attrs": attrs,
             "text": [],
+            "accessible_text": [],
             "hidden": hidden,
             "links": [],
             "controls": [],
+            "sr_only_text": [],
             "ancestors": tuple(item["tag"] for item in self._stack),
         }
         self._stack.append(node)
@@ -136,6 +148,10 @@ class PageParser(HTMLParser):
         node = self._stack[-1]
         for ancestor in self._stack:
             ancestor["text"].append(data)
+        if not node["hidden"]:
+            for ancestor in self._stack:
+                if not ancestor["hidden"]:
+                    ancestor["accessible_text"].append(data)
         if node["tag"] == "script":
             self.script_chars += len(data)
             if self._jsonld_buffer is not None:
@@ -156,7 +172,17 @@ class PageParser(HTMLParser):
         del self._stack[index:]
         node = nodes[0]
         text = compact(" ".join(node["text"]))
+        accessible_text = compact(" ".join(node["accessible_text"]))
         attrs = node["attrs"]
+        if attrs.get("id") and accessible_text and not node.get("hidden"):
+            self.element_text_by_id[attrs["id"]] = accessible_text
+        class_tokens = set(re.split(r"\s+", attrs.get("class", "").casefold()))
+        if text and class_tokens.intersection({
+                "sr-only", "sr_only", "visually-hidden", "visuallyhidden",
+                "screen-reader-only", "screen-reader-text", "a11y-hidden"}):
+            for ancestor in self._stack[:index]:
+                if ancestor["tag"] in {"button", "input", "select"}:
+                    ancestor["sr_only_text"].append(text)
         if tag in {"p", "li", "dt", "dd", "td", "th"} and text:
             self.text_elements.append({"tag": tag, "text": text})
         if tag == "title":
@@ -177,15 +203,41 @@ class PageParser(HTMLParser):
                 ancestor["links"].append(link)
         elif re.fullmatch(r"h[1-6]", tag):
             self.headings.append({"level": tag, "text": text})
+            if text:
+                for ancestor in reversed(self._stack[:index]):
+                    if ancestor["tag"] in {"section", "article", "form", "fieldset"}:
+                        ancestor["heading_context"] = text
+                        break
+        elif tag == "legend" and text:
+            for ancestor in reversed(self._stack[:index]):
+                if ancestor["tag"] == "fieldset":
+                    ancestor["legend_context"] = text
+                    break
         elif tag in {"button", "input", "select"}:
+            surrounding_heading = next((
+                ancestor.get("heading_context", "")
+                for ancestor in reversed(self._stack[:index])
+                if ancestor["tag"] in {"section", "article", "form", "fieldset"}
+                and ancestor.get("heading_context")
+            ), "")
+            fieldset_context = next((
+                ancestor.get("legend_context", "")
+                for ancestor in reversed(self._stack[:index])
+                if ancestor["tag"] == "fieldset" and ancestor.get("legend_context")
+            ), "")
             control = {
                 "tag": tag,
                 "id": attrs.get("id", ""),
                 "type": attrs.get("type", ""),
                 "name": attrs.get("name", ""),
-                "text": text or attrs.get("value", "") or attrs.get("placeholder", ""),
+                "text": accessible_text if tag != "input" else attrs.get("value", ""),
                 "aria_label": attrs.get("aria-label", ""),
+                "aria_labelledby": attrs.get("aria-labelledby", ""),
+                "title": attrs.get("title", ""),
                 "placeholder": attrs.get("placeholder", ""),
+                "sr_only_text": compact(" ".join(node.get("sr_only_text", []))),
+                "fieldset_context": fieldset_context,
+                "surrounding_heading": surrounding_heading,
                 "disabled": "true" if "disabled" in attrs else "false",
             }
             self.controls.append(control)
@@ -196,6 +248,7 @@ class PageParser(HTMLParser):
                 self.labels[attrs["for"]] = text
             for control in node.get("controls", []):
                 if text:
+                    control["wrapped_label"] = text
                     control["label"] = text
         elif tag == "form":
             self.forms.append({
@@ -223,7 +276,11 @@ def parse_page(html: str, url: str) -> PageParser:
     parser.close()
     for control in parser.controls:
         if control.get("id") in parser.labels:
+            control["associated_label"] = parser.labels[control["id"]]
             control["label"] = parser.labels[control["id"]]
+        references = control.get("aria_labelledby", "").split()
+        control["aria_labelledby_text"] = compact(" ".join(
+            parser.element_text_by_id.get(reference, "") for reference in references))
     return parser
 
 
@@ -993,14 +1050,87 @@ def improvement_opportunity_audit(page: PageParser, url: str,
     return deduplicate_opportunities(items)
 
 
+def _normalized_opportunity_url(url: str) -> str:
+    split = urllib.parse.urlsplit(url)
+    path = re.sub(r"/{2,}", "/", split.path or "/")
+    if path != "/":
+        path = path.rstrip("/")
+    query = urllib.parse.urlencode(sorted(urllib.parse.parse_qsl(
+        split.query, keep_blank_values=True)))
+    return urllib.parse.urlunsplit((
+        split.scheme.casefold(), split.netloc.casefold(), path, query, ""))
+
+
+def _url_scope(url: str) -> str:
+    path = urllib.parse.unquote(urllib.parse.urlsplit(url).path).strip("/")
+    parts = [part for part in path.split("/") if part and part.casefold() not in {
+        "index.html", "index.htm", "index.php"}]
+    value = parts[-1] if parts else "landing"
+    value = re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
+    return (value or "landing")[:48].rstrip("-")
+
+
+def _opportunity_scope(item: dict[str, Any]) -> str:
+    role = str(item.get("page_role") or "").casefold()
+    if role == "navigation":
+        role = "collection"
+    if role in {"collection", "detail", "support", "policy", "landing"}:
+        return role
+    return _url_scope(item["evidence"]["url"])
+
+
+def _merge_opportunity_group(group: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge one rule/page group without discarding distinct cached evidence."""
+    canonical = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"))
+    result = deepcopy(min(group, key=canonical))
+    observed_values: dict[str, Any] = {}
+    for item in group:
+        observed = item.get("evidence", {}).get("observed")
+        observed_values.setdefault(canonical(observed), observed)
+    if len(observed_values) > 1:
+        observations: dict[str, Any] = {}
+        for observed in observed_values.values():
+            values = observed if isinstance(observed, list) else [observed]
+            for value in values:
+                observations.setdefault(canonical(value), value)
+        result["evidence"]["observed"] = [
+            deepcopy(observations[key]) for key in sorted(observations)]
+    return result
+
+
 def deduplicate_opportunities(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group by rule/page, merge evidence, and scope colliding public IDs."""
     priority_order = {"high": 0, "medium": 1, "low": 2}
-    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for item in items:
-        key = (item["id"], item["evidence"]["url"])
-        merged.setdefault(key, item)
-    return sorted(merged.values(), key=lambda item: (
-        priority_order[item["priority"]], item["id"], item["evidence"]["url"]))
+        url = _normalized_opportunity_url(item["evidence"]["url"])
+        grouped.setdefault((item["id"], url), []).append(item)
+    merged = [_merge_opportunity_group(grouped[key]) for key in sorted(grouped)]
+
+    by_rule: dict[str, list[dict[str, Any]]] = {}
+    for item in merged:
+        by_rule.setdefault(item["id"], []).append(item)
+    for rule_id, group in by_rule.items():
+        if len(group) < 2:
+            continue
+        candidates = [_opportunity_scope(item) for item in group]
+        candidate_counts = {value: candidates.count(value) for value in set(candidates)}
+        used: set[str] = set()
+        for item, candidate in sorted(zip(group, candidates), key=lambda pair: (
+                _normalized_opportunity_url(pair[0]["evidence"]["url"]), pair[1])):
+            if candidate_counts[candidate] > 1:
+                url_scope = _url_scope(item["evidence"]["url"])
+                candidate = f"{candidate}-{url_scope}" if url_scope != candidate else candidate
+            scoped_id = f"{rule_id}-{candidate}"
+            if scoped_id in used:
+                normalized_url = _normalized_opportunity_url(item["evidence"]["url"])
+                suffix = hashlib.sha256(normalized_url.encode()).hexdigest()[:8]
+                scoped_id = f"{scoped_id}-{suffix}"
+            item["id"] = scoped_id
+            used.add(scoped_id)
+    return sorted(merged, key=lambda item: (
+        priority_order[item["priority"]], item["id"],
+        _normalized_opportunity_url(item["evidence"]["url"])))
 
 
 def classify_link(link: dict[str, str]) -> str:
@@ -1064,6 +1194,88 @@ def _has_next_action(page: PageParser) -> bool:
                    classify_link(link) == "detail" for link in page.links)
 
 
+_CONTROL_NAME_CHECKS = [
+    "direct text", "aria-label", "aria-labelledby", "title",
+    "associated label", "wrapped label", "placeholder",
+    "visually hidden text", "fieldset context", "surrounding heading",
+]
+
+
+def _static_control_name(control: dict[str, Any]) -> tuple[str, str]:
+    """Return the first supported name and its static HTML mechanism."""
+    tag = str(control.get("tag") or "").casefold()
+    control_type = str(control.get("type") or "").casefold()
+    direct_text = control.get("text") if (
+        tag == "button" or (tag == "input" and control_type in {"button", "reset"})) else ""
+    candidates = [
+        ("direct text", direct_text),
+        ("aria-label", control.get("aria_label")),
+        ("aria-labelledby", control.get("aria_labelledby_text")),
+        ("title", control.get("title")),
+        ("associated label", control.get("associated_label")),
+        ("wrapped label", control.get("wrapped_label")),
+    ]
+    placeholder_types = {
+        "", "text", "search", "email", "tel", "url", "password", "number",
+        "date", "datetime-local", "month", "time", "week",
+    }
+    if tag == "input" and control_type in placeholder_types:
+        candidates.append(("placeholder", control.get("placeholder")))
+    candidates.extend([
+        ("visually hidden text", control.get("sr_only_text")),
+        ("fieldset context", control.get("fieldset_context")),
+        ("surrounding heading", control.get("surrounding_heading")),
+    ])
+    for mechanism, value in candidates:
+        normalized = compact(str(value or ""))
+        if normalized:
+            return normalized, mechanism
+    return "", ""
+
+
+def _unlabelled_control_evidence(control: dict[str, Any]) -> dict[str, Any]:
+    check_results = {name: "not observed" for name in _CONTROL_NAME_CHECKS}
+    placeholder_types = {
+        "", "text", "search", "email", "tel", "url", "password", "number",
+        "date", "datetime-local", "month", "time", "week",
+    }
+    if (control.get("tag") != "input"
+            or str(control.get("type") or "").casefold() not in placeholder_types):
+        check_results["placeholder"] = "not applicable to this control"
+    return {
+        "tag": control.get("tag", ""),
+        "type": control.get("type", ""),
+        "id": control.get("id", ""),
+        "name": control.get("name", ""),
+        "checks": list(_CONTROL_NAME_CHECKS),
+        "check_results": check_results,
+        "observed": "No accessible name was observable in the fetched HTML using the supported static checks.",
+    }
+
+
+def _group_unlabelled_control_evidence(controls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Retain each distinct control signature and count indistinguishable repeats."""
+    grouped: dict[str, tuple[dict[str, Any], int]] = {}
+    for control in controls:
+        evidence = _unlabelled_control_evidence(control)
+        key = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+        prior, count = grouped.get(key, (evidence, 0))
+        grouped[key] = (prior, count + 1)
+    result = []
+    for key in sorted(grouped):
+        evidence, count = grouped[key]
+        if count > 1:
+            evidence["occurrence_count"] = count
+        result.append(evidence)
+    return result
+
+
+def _public_page_role(role: str) -> str:
+    role = (role or "unknown").casefold()
+    return "collection" if role == "navigation" else (
+        role if role in {"detail", "support", "policy", "landing"} else "unknown")
+
+
 def visitor_journey_audit(target_page: PageParser, target_url: str,
                           sampled_pages: list[dict[str, Any]]) -> tuple[list[dict], list[dict], list[str]]:
     """Compare the cached landing page with a small, non-recursive page sample."""
@@ -1112,7 +1324,7 @@ def visitor_journey_audit(target_page: PageParser, target_url: str,
                                   "type": node.get("@type")}, affected_url=item["url"],
                         evidence_type="cached-visible-text/json-ld",
                         responsible_party="site-published content",
-                        impact="Visitors and automated consumers receive different identities for the same page.",
+                    impact="The fetched visible and machine-readable representations publish different identities for the same page.",
                         suggested_action="Align the title, primary heading, and scoped machine-readable entity name.",
                         priority=89))
 
@@ -1179,17 +1391,21 @@ def visitor_journey_audit(target_page: PageParser, target_url: str,
 
     for item in pages:
         page = item["page"]
-        unlabeled = [control for control in page.controls
-                     if control.get("tag") in {"input", "select", "button"}
-                     and not (control.get("text") or control.get("aria_label") or control.get("label"))
-                     and control.get("type") not in {"hidden", "submit", "checkbox", "radio"}]
+        unlabeled_controls = [
+            control for control in page.controls
+            if control.get("tag") in {"input", "select", "button"}
+            and control.get("type", "").casefold() not in {"hidden", "submit"}
+            and not _static_control_name(control)[0]
+        ]
+        unlabeled = _group_unlabelled_control_evidence(unlabeled_controls)
         if unlabeled:
             opportunities.append(opportunity(
                 rule_id="opportunity-control-labels", priority="high", category="engagement",
-                action="Give each interactive control a visible or programmatic task label and nearby outcome guidance.",
-                reason="The fetched representation contains controls with no inspectable label.",
+                action="Expose a visible or programmatic task label for the affected control and provide nearby outcome guidance.",
+                reason="No accessible name was observable in the fetched HTML using the supported static checks.",
                 url=item["url"], source="initial HTML" if item["role"] == "landing" else "sampled internal page",
-                observed=json.dumps(unlabeled[:5], sort_keys=True), confidence="certain"))
+                observed=unlabeled, confidence="certain",
+                page_role=_public_page_role(item["role"])))
 
     product_pages = [item for item in pages if item["role"] == "detail"]
     for item in product_pages:
@@ -1281,7 +1497,7 @@ def visitor_journey_audit(target_page: PageParser, target_url: str,
                               "listing_url": target_url, "detail_url": item["url"]},
                     affected_url=item["url"], evidence_type="cached-listing/detail-visible-text",
                     responsible_party="site-published content",
-                    impact="Visitors can receive contradictory decision-critical pricing along one journey.",
+                    impact="The fetched listing and detail representations publish contradictory decision-critical pricing for the same offering.",
                     suggested_action="Publish one scoped price for this offering across the listing and detail representations.",
                     priority=92))
 

@@ -6,16 +6,20 @@ from __future__ import annotations
 import json
 import pathlib
 import concurrent.futures
+import contextlib
+import io
 import inspect
 import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
+import signaltrace as signaltrace_cli
 from analyzers import (
     bot_directives_audit, content_engagement_audit, deduplicate_findings,
     deduplicate_opportunities, destination_observation, improvement_opportunity_audit,
-    parse_page, same_as_declarations, same_as_destination_observation,
+    finding, opportunity, parse_page, same_as_declarations, same_as_destination_observation,
     source_verification, structured_data_audit, visitor_journey_audit,
 )
 from runtime import Evidence, LimitError, RequestGovernor, RobotsDecision
@@ -372,6 +376,202 @@ class ImprovementOpportunityTests(unittest.TestCase):
 
 
 class VisitorJourneyTests(unittest.TestCase):
+    def test_same_opportunity_type_on_two_pages_has_distinct_stable_ids(self):
+        landing = parse_page(
+            "<title>Widget shop</title><h1>Widget shop</h1><button></button>",
+            "https://shop.example/")
+        detail = parse_page(
+            "<title>Widget</title><h1>Widget</h1><button></button>",
+            "https://shop.example/products/widget")
+        sampled = [{
+            "role": "detail", "url": detail.base_url, "page": detail,
+            "link": {"url": detail.base_url, "text": "Widget"},
+        }]
+        _, opportunities, _ = visitor_journey_audit(landing, landing.base_url, sampled)
+        ids = [item["id"] for item in opportunities
+               if item["id"].startswith("opportunity-control-labels")]
+        self.assertEqual(ids, [
+            "opportunity-control-labels-detail",
+            "opportunity-control-labels-landing",
+        ])
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_repeated_empty_controls_on_one_page_are_grouped_with_all_evidence(self):
+        page = parse_page(
+            "<title>Tools</title><h1>Tools</h1>"
+            "<button></button><button></button><input name='query'><select id='sort'></select>",
+            "https://example.com/tools")
+        _, opportunities, _ = visitor_journey_audit(page, page.base_url, [])
+        grouped = [item for item in opportunities
+                   if item["id"].startswith("opportunity-control-labels")]
+        self.assertEqual(len(grouped), 1)
+        evidence = grouped[0]["evidence"]["observed"]
+        self.assertEqual(len(evidence), 3)
+        self.assertEqual({item["tag"] for item in evidence}, {"button", "input", "select"})
+        button = next(item for item in evidence if item["tag"] == "button")
+        self.assertEqual(button["occurrence_count"], 2)
+        self.assertTrue(all(item["checks"] for item in evidence))
+        self.assertTrue(all("No accessible name was observable" in item["observed"]
+                            for item in evidence))
+        self.assertIs(grouped[0]["is_finding"], False)
+
+    def test_opportunity_ids_and_order_are_stable_across_fixture_runs(self):
+        def run_fixture():
+            landing = parse_page(
+                "<title>Widget shop</title><h1>Widget shop</h1><button></button>",
+                "https://shop.example/")
+            detail = parse_page(
+                "<title>Widget</title><h1>Widget</h1><input>",
+                "https://shop.example/products/widget")
+            return visitor_journey_audit(landing, landing.base_url, [{
+                "role": "detail", "url": detail.base_url, "page": detail,
+                "link": {"url": detail.base_url, "text": "Widget"},
+            }])[1]
+        first = run_fixture()
+        second = run_fixture()
+        self.assertEqual(first, second)
+        self.assertEqual([item["id"] for item in first], [item["id"] for item in second])
+
+    def test_supported_static_control_names_suppress_label_opportunity(self):
+        page = parse_page("""
+            <title>Control examples</title><h1>Control examples</h1>
+            <button>Save</button>
+            <button aria-label='Open menu'></button>
+            <span id='filter-name' class='sr-only'>Open filters</span>
+            <button aria-labelledby='filter-name'></button>
+            <input id='query'><label for='query'>Search catalog</label>
+            <label>Email address <input type='email'></label>
+            <button title='Close dialog'></button>
+            <input placeholder='Postal code'>
+            <button><span class='visually-hidden'>Previous page</span></button>
+            <fieldset><legend>Delivery speed</legend><input type='radio'></fieldset>
+            <section><h2>Sort products</h2><select></select></section>
+            """, "https://example.com/controls")
+        _, opportunities, _ = visitor_journey_audit(page, page.base_url, [])
+        self.assertFalse(any(item["id"].startswith("opportunity-control-labels")
+                             for item in opportunities))
+
+    def test_truly_unlabelled_control_uses_cautious_evidence_wording(self):
+        page = parse_page("<title>Tools</title><h1>Tools</h1><button id='mystery'></button>",
+                          "https://example.com/tools")
+        _, opportunities, _ = visitor_journey_audit(page, page.base_url, [])
+        item = next(value for value in opportunities
+                    if value["id"].startswith("opportunity-control-labels"))
+        self.assertEqual(
+            item["action"],
+            "Expose a visible or programmatic task label for the affected control and provide nearby outcome guidance.")
+        self.assertEqual(
+            item["reason"],
+            "No accessible name was observable in the fetched HTML using the supported static checks.")
+        control = item["evidence"]["observed"][0]
+        self.assertEqual(control["id"], "mystery")
+        self.assertIn("aria-labelledby", control["checks"])
+        self.assertTrue(all(value in {"not observed", "not applicable to this control"}
+                            for value in control["check_results"].values()))
+
+    def test_missing_label_is_opportunity_without_behavioral_certainty(self):
+        page = parse_page("<title>Tools</title><h1>Tools</h1><button></button>",
+                          "https://example.com/tools")
+        findings, opportunities, _ = visitor_journey_audit(page, page.base_url, [])
+        item = next(value for value in opportunities
+                    if value["id"].startswith("opportunity-control-labels"))
+        self.assertEqual(findings, [])
+        self.assertIs(item["is_finding"], False)
+        generated = " ".join((item["action"], item["reason"])).casefold()
+        for phrase in ("users are confused", "will abandon", "reduces conversion"):
+            self.assertNotIn(phrase, generated)
+
+    def test_missing_continuation_is_opportunity_not_finding(self):
+        landing = parse_page(
+            "<title>Shop</title><h1>Shop</h1><a href='/products/widget'>Widget</a>",
+            "https://shop.example/")
+        detail = parse_page(
+            "<title>Widget</title><h1>Widget</h1><p>Price $10.00. In stock.</p>"
+            "<h2>Specifications</h2><p>Weight: 2 kg.</p>",
+            "https://shop.example/products/widget")
+        link = next(item for item in landing.links if item["url"] == detail.base_url)
+        findings, opportunities, _ = visitor_journey_audit(landing, landing.base_url, [{
+            "role": "detail", "url": detail.base_url, "page": detail, "link": link,
+        }])
+        continuation = next(item for item in opportunities
+                            if item["id"].startswith("opportunity-detail-continuation"))
+        self.assertIs(continuation["is_finding"], False)
+        self.assertFalse(any(item.get("_code") == "detail-continuation" for item in findings))
+
+    def test_broken_http_link_remains_confirmed_finding(self):
+        link = {"url": "https://example.com/missing", "text": "Product details"}
+        evidence = Evidence(link["url"], link["url"], 404, {}, b"", [], "http-error")
+        findings, _ = destination_observation(link, "https://shop.example/", evidence, None)
+        self.assertEqual(len(findings), 1)
+        self.assertIs(findings[0]["is_finding"], True)
+        self.assertEqual(findings[0]["_code"], "destination-broken")
+
+    def test_price_mismatch_remains_confirmed_finding(self):
+        landing = parse_page(
+            "<h1>Widget shop</h1><article><a href='/product/widget'>Widget</a>"
+            "<span>$10.00</span></article>", "https://shop.example/")
+        detail = parse_page(
+            "<h1>Widget</h1><p>Price $12.00. In stock.</p><h2>Specifications</h2>"
+            "<p>Weight: 2 kg</p><button>Add to cart</button>",
+            "https://shop.example/product/widget")
+        link = next(item for item in landing.links if item["url"] == detail.base_url)
+        findings, _, _ = visitor_journey_audit(landing, landing.base_url, [{
+            "role": "detail", "url": detail.base_url, "page": detail, "link": link,
+        }])
+        mismatch = next(item for item in findings
+                        if item["_code"] == "listing-detail-price-conflict")
+        self.assertIs(mismatch["is_finding"], True)
+
+    def test_final_report_separates_static_risks_and_bounds_language(self):
+        page = parse_page("<h1>Widget</h1><p>Out of stock.</p>",
+                          "https://shop.example/widget")
+        findings, _ = content_engagement_audit(page, page.base_url)
+        opportunities = improvement_opportunity_audit(page, page.base_url)
+        malicious = opportunity(
+            rule_id="opportunity-language-guard", priority="low", category="engagement",
+            action="Consider clearer guidance.", reason="Users are confused and will abandon.",
+            url=page.base_url, source="initial HTML", observed="No continuation link observed",
+            confidence="likely")
+        opportunities.append(malicious)
+        governor = RequestGovernor(spacing_seconds=0)
+        report = _report(page.base_url, governor, findings, [], [], opportunities)
+        self.assertEqual(report["findings"], [])
+        recovery = next(item for item in report["suggested_actions"]
+                        if item["id"].startswith("opportunity-recovery-path"))
+        self.assertIs(recovery["is_finding"], False)
+        self.assertEqual(report["coverage"]["behavioral_impact"]["status"], "not measured")
+        for item in report["suggested_actions"]:
+            self.assertIn("check_performed", item["evidence"])
+            self.assertIn("not_verified", item["evidence"])
+        serialized = json.dumps(report).casefold()
+        for phrase in ("users are confused", "will abandon", "reduces conversion",
+                       "this causes bounce", "the ui is boring"):
+            self.assertNotIn(phrase, serialized)
+
+    def test_classified_result_arrays_are_deterministic(self):
+        def build_result():
+            confirmed = finding(
+                code="fixture-http-404", title="Fixture URL returned HTTP 404",
+                severity="High", confidence=1.0, evidence={"status": 404},
+                affected_url="https://example.com/missing", evidence_type="http-response",
+                responsible_party="site-published link",
+                impact="The fetched destination returned HTTP 404.",
+                suggested_action="Update or remove the URL.", priority=90)
+            suggested = opportunity(
+                rule_id="opportunity-fixture", priority="low", category="engagement",
+                action="Consider adding a continuation link.",
+                reason="No clear continuation path was observable in the fetched HTML.",
+                url="https://example.com/", source="initial HTML",
+                observed="No matching continuation link", confidence="likely")
+            report = _report("https://example.com/", RequestGovernor(spacing_seconds=0),
+                             [confirmed], [], [], [suggested])
+            return report["findings"], report["suggested_actions"]
+        first = build_result()
+        second = build_result()
+        self.assertEqual(first, second)
+        self.assertTrue(all(item["is_finding"] for item in first[0]))
+        self.assertTrue(all(not item["is_finding"] for item in first[1]))
+
     def test_multi_page_fixture_selects_roles_and_broken_link_is_confirmed(self):
         landing = parse_page("""
             <nav><a href='/category/books'>Books</a><a href='/about'>About us</a></nav>
@@ -742,6 +942,52 @@ class InputModeTests(unittest.TestCase):
     @staticmethod
     def _script() -> pathlib.Path:
         return pathlib.Path(__file__).resolve().with_name("signaltrace.py")
+
+    @staticmethod
+    def _serialized_cli_output(*, pretty: bool) -> tuple[dict, str, str]:
+        expected = {
+            "site": "https://example.com/",
+            "summary": {"total_findings": 0},
+            "coverage": {"checks_completed": ["target-fetch"]},
+            "findings": [],
+            "suggested_actions": [],
+        }
+        argv = ["signaltrace.py"] + (["--pretty"] if pretty else []) + [expected["site"]]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(signaltrace_cli, "run", return_value=expected), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            exit_code = signaltrace_cli.main()
+        if exit_code != 0:
+            raise AssertionError(f"CLI serialization fixture exited with {exit_code}")
+        return expected, stdout.getvalue(), stderr.getvalue()
+
+    def test_default_output_is_compact_valid_json(self):
+        expected, output, _ = self._serialized_cli_output(pretty=False)
+        self.assertEqual(json.loads(output), expected)
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertTrue(output.endswith("\n"))
+
+    def test_pretty_output_is_the_identical_json_object(self):
+        expected, compact, _ = self._serialized_cli_output(pretty=False)
+        _, pretty, _ = self._serialized_cli_output(pretty=True)
+        self.assertEqual(json.loads(compact), expected)
+        self.assertEqual(json.loads(pretty), json.loads(compact))
+
+    def test_pretty_output_has_indentation_and_trailing_newline(self):
+        _, output, _ = self._serialized_cli_output(pretty=True)
+        self.assertGreater(len(output.splitlines()), 1)
+        self.assertIn('\n  "site":', output)
+        self.assertTrue(output.endswith("\n"))
+
+    def test_both_output_modes_contain_only_one_json_value(self):
+        decoder = json.JSONDecoder()
+        for pretty in (False, True):
+            with self.subTest(pretty=pretty):
+                _, output, stderr = self._serialized_cli_output(pretty=pretty)
+                _, end = decoder.raw_decode(output)
+                self.assertEqual(output[end:].strip(), "")
+                self.assertEqual(stderr, "")
 
     def test_positional_url_does_not_read_open_silent_stdin(self):
         process = subprocess.Popen(

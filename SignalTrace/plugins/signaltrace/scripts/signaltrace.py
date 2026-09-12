@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import json
+import re
 import sys
 import urllib.parse
 from typing import Any
@@ -14,7 +15,7 @@ from typing import Any
 from analyzers import (
     bot_directives_audit, content_engagement_audit, deduplicate_findings,
     classify_link, deduplicate_opportunities, destination_observation, finding,
-    improvement_opportunity_audit, parse_page, source_verification, structured_data_audit,
+    improvement_opportunity_audit, opportunity, parse_page, source_verification, structured_data_audit,
     same_as_declarations, same_as_destination_observation, visitor_journey_audit,
 )
 from runtime import Evidence, LimitError, RequestGovernor, UnsafeTarget
@@ -26,6 +27,79 @@ CHECKS = [
     "sameAs-identity", "visitor-journey", "improvement-opportunities",
 ]
 
+BEHAVIORAL_EVIDENCE_LIMIT = (
+    "Actual user behavior, analytics outcomes, visual quality, and sales impact were not measured; "
+    "they require browser testing, user testing, analytics, or controlled experiments."
+)
+
+_STATIC_RISK_OPPORTUNITIES = {
+    "image-only-evidence": {
+        "id": "opportunity-media-text-equivalent", "priority": "high",
+        "category": "content-clarity",
+        "action": "Provide equivalent readable text for factual content carried by images or media.",
+        "reason": "The fetched HTML did not expose a readable equivalent for the observed image evidence. "
+                  "Behavioral impact was not measured.",
+    },
+    "oos-no-route": {
+        "id": "opportunity-recovery-path", "priority": "high", "category": "availability",
+        "action": "Consider exposing a relevant alternative, notification path, or contact route.",
+        "reason": "The fetched page did not expose an observable recovery path for its unavailable state. "
+                  "Behavioral impact was not measured.",
+    },
+}
+
+
+def _separate_static_risks(findings: list[dict[str, Any]],
+                           opportunities: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
+                                                                          list[dict[str, Any]]]:
+    """Keep observable-but-unverified usability risks out of confirmed findings."""
+    confirmed: list[dict[str, Any]] = []
+    known = {(item["id"], item["evidence"]["url"]) for item in opportunities}
+    for item in findings:
+        rule = _STATIC_RISK_OPPORTUNITIES.get(item.get("_code", ""))
+        if rule is None:
+            confirmed.append(item)
+            continue
+        key = (rule["id"], item["affected_url"])
+        if key not in known:
+            opportunities.append(opportunity(
+                rule_id=rule["id"], priority=rule["priority"], category=rule["category"],
+                action=rule["action"], reason=rule["reason"], url=item["affected_url"],
+                source="initial HTML", observed=item["evidence"], confidence="likely"))
+            known.add(key)
+    return confirmed, opportunities
+
+
+def _annotate_result_evidence(items: list[dict[str, Any]]) -> None:
+    """Record the performed check and the shared interpretation boundary."""
+    for item in items:
+        check = item.get("_code") or item.get("id") or item.get("title")
+        evidence = item.get("evidence")
+        blocks = evidence if isinstance(evidence, list) else [evidence]
+        for block in blocks:
+            if isinstance(block, dict):
+                block.setdefault("check_performed", check)
+                block.setdefault("not_verified", BEHAVIORAL_EVIDENCE_LIMIT)
+
+
+_PROHIBITED_GENERATED_LANGUAGE = re.compile(
+    r"\b(?:users? are confused|visitors? will abandon|this causes? bounce|"
+    r"the ui is boring|this reduces? conversions?|customers? cannot use (?:the|this) site|"
+    r"visitors? dislike the design|(?:will |guaranteed to )?increase sales)\b", re.I)
+
+
+def _enforce_evidence_bounded_language(items: list[dict[str, Any]]) -> None:
+    """Fail closed to cautious language without altering quoted evidence."""
+    for item in items:
+        for field in ("title", "reason", "action", "impact", "suggested_action"):
+            value = item.get(field)
+            if isinstance(value, str) and _PROHIBITED_GENERATED_LANGUAGE.search(value):
+                item[field] = (
+                    "The fetched evidence establishes the reported condition; behavioral impact was not measured."
+                    if item.get("is_finding") else
+                    "Consider addressing the observed condition; behavioral impact was not measured."
+                )
+
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one read-only SignalTrace audit")
@@ -33,6 +107,9 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument(
         "--input-stdin", action="store_true",
         help="read one JSON audit envelope from stdin; stdin is otherwise ignored")
+    parser.add_argument(
+        "--pretty", action="store_true",
+        help="format the JSON report with two-space indentation")
     parser.add_argument("--max-requests", type=int, default=DEFAULTS.global_request_maximum)
     parser.add_argument("--target-request-maximum", type=int, default=DEFAULTS.target_request_maximum)
     parser.add_argument("--max-concurrency", type=int, default=DEFAULTS.cross_origin_concurrency)
@@ -508,8 +585,14 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
             opportunities: list[dict[str, Any]] | None = None,
             journey_coverage: dict[str, list[dict[str, Any]]] | None = None,
             same_as_coverage: dict[str, Any] | None = None) -> dict[str, Any]:
+    opportunities = opportunities or []
+    findings, opportunities = _separate_static_risks(findings, opportunities)
+    _annotate_result_evidence(findings)
+    _annotate_result_evidence(opportunities)
+    _enforce_evidence_bounded_language(findings)
+    _enforce_evidence_bounded_language(opportunities)
     findings = deduplicate_findings(findings)
-    opportunities = deduplicate_opportunities(opportunities or [])
+    opportunities = deduplicate_opportunities(opportunities)
     counts = {name: sum(1 for item in findings if item["severity"] == name)
               for name in ("Critical", "High", "Medium")}
     snapshot = governor.snapshot()
@@ -543,6 +626,10 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
             "origins_stopped": snapshot["origins_stopped"],
             "subagent_facility_available": False,
             "execution_mode": "local",
+            "behavioral_impact": {
+                "status": "not measured",
+                "detail": BEHAVIORAL_EVIDENCE_LIMIT,
+            },
             "checks_completed": [name for name in CHECKS if name in set(completed)],
             "checks_unresolved": list(dict.fromkeys(unresolved)),
             "unresolved_checks": list(dict.fromkeys(unresolved)),
@@ -564,7 +651,10 @@ def main() -> int:
         print(f"signaltrace: invalid input: {exc}", file=sys.stderr)
         return 2
     report = run(payload, args)
-    json.dump(report, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    if args.pretty:
+        json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
+    else:
+        json.dump(report, sys.stdout, ensure_ascii=False, separators=(",", ":"))
     sys.stdout.write("\n")
     return 0
 

@@ -31,6 +31,17 @@ Python 3.10+ is sufficient. Output is exactly one JSON value on stdout; diagnost
 python3 plugins/signaltrace/scripts/signaltrace.py https://example.com/
 ```
 
+Write the default compact JSON or an equivalent indented report to a file:
+
+```bash
+python3 plugins/signaltrace/scripts/signaltrace.py https://example.com > report.json
+
+python3 plugins/signaltrace/scripts/signaltrace.py \
+  --pretty https://example.com > report-readable.json
+```
+
+Both modes write exactly one JSON object and a trailing newline to stdout. `--pretty` changes formatting only; diagnostics remain on stderr.
+
 Optional bounded evidence can be supplied through a JSON envelope on stdin:
 
 ```bash
@@ -67,7 +78,11 @@ Every audit is read-only: SignalTrace does not modify a live website, submit for
 
 ## Findings and suggested improvements
 
-A confirmed finding means the audit has direct evidence that something is failing, contradictory, or inaccessible. A suggested improvement means cached landing-page and sampled-journey evidence supports a reasonable way to strengthen discoverability, clarity, trust, navigation, availability handling, or visitor continuation, but failure has not been proven. Missing optional features are never promoted to findings merely because they are absent. Static HTML can support observations about labels, readable facts, links, controls, forms, and redirect outcomes; SignalTrace does not claim mobile or visual-design defects without browser rendering.
+A confirmed finding means the audit has direct evidence that something is failing, contradictory, or inaccessible. A suggested improvement means cached landing-page and sampled-journey evidence supports a reasonable way to strengthen discoverability, clarity, trust, navigation, availability handling, or visitor continuation, but failure has not been proven. Missing optional features are never promoted to findings merely because they are absent. Static HTML analysis identifies observable risks and opportunities; it does not prove actual user confusion, abandonment, conversion loss, usability, or visual-design quality. Recommendations describe the observed evidence and a possible improvement, and unsupported behavioral conclusions are prohibited.
+
+Static source also cannot establish bounce rate, whether visitors dislike or are bored by a design, or whether a recommendation will increase sales. Those questions require browser or user testing, analytics, or controlled experiments. Final findings are directly demonstrated conditions marked `is_finding: true`; suggested opportunities are plausible but unverified improvements marked `is_finding: false`. Serialized evidence records the performed check and what was not verified, while `coverage.behavioral_impact` clearly reports that behavioral outcomes were not measured.
+
+Control-name analysis checks direct text, `aria-label`, resolvable `aria-labelledby`, associated and wrapping labels, `title`, appropriate input placeholders, common visually hidden text, and deterministically associated fieldset or heading context. Any supported name suppresses the opportunity. Truly unnamed controls are grouped into one non-finding recommendation per page rather than one recommendation per control. When the same opportunity type occurs on multiple pages, final IDs are deterministically scoped by page role or normalized URL, and ordering is stable across runs.
 
 The improvement specialist can also identify product-positioning and audience-communication opportunities. It extracts exact product or service facts from cached HTML and structured data, then tests whether supported use cases and attributes appear in titles, headings, descriptions, and category labels. Any `candidate_audience` is explicitly a hypothesis based on observed attributes—not a verified demographic—and generated headlines, taglines, labels, and search phrases are recommendations, not claims about likely performance. When the cached page does not support a use case, no audience is invented. A lone visible price is not treated as a budget tier; explicit threshold or value-tier wording is required.
 
@@ -105,4 +120,4 @@ python3 /path/to/skill-creator/scripts/quick_validate.py plugins/signaltrace/ski
 python3 /path/to/plugin-creator/scripts/validate_plugin.py plugins/signaltrace
 ```
 
-SignalTrace is diagnostic. Its findings are evidence-bound recommendations, not claims about traffic, conversion, demand, or guaranteed AI citation.
+SignalTrace is diagnostic. Its findings are directly demonstrated, evidence-bound defects; its suggested actions are cautious opportunities. Neither is a claim about traffic, conversion, demand, customer behavior, sales impact, visual appeal, or guaranteed AI citation.
