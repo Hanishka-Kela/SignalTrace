@@ -99,7 +99,7 @@ class AnalyzerTests(unittest.TestCase):
 class RuntimeTests(unittest.TestCase):
     def test_robots_denial_prevents_page_request(self):
         governor = RequestGovernor(max_requests=3, max_concurrency=1, timeout=1,
-                                   max_body_bytes=1000, deadline_seconds=3)
+                                   max_body_bytes=1000, deadline_seconds=3, max_per_origin=3)
         calls = []
         def fake_request(url, body_limit=None):
             calls.append(url)
@@ -112,7 +112,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_concurrent_same_origin_fetches_share_one_robots_request(self):
         governor = RequestGovernor(max_requests=5, max_concurrency=2, timeout=1,
-                                   max_body_bytes=1000, deadline_seconds=3)
+                                   max_body_bytes=1000, deadline_seconds=3, max_per_origin=5)
         calls = []
         def fake_request(url, body_limit=None):
             calls.append(url)

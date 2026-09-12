@@ -56,10 +56,12 @@ class Evidence:
 
 class RequestGovernor:
     def __init__(self, *, max_requests: int, max_concurrency: int,
-                 timeout: float, max_body_bytes: int, deadline_seconds: float):
+                 timeout: float, max_body_bytes: int, deadline_seconds: float,
+                 max_per_origin: int = 6):
         self.started_at = time.monotonic()
         self.deadline = self.started_at + deadline_seconds
         self.max_requests = max_requests
+        self.max_per_origin = min(max_requests, max_per_origin)
         self.timeout = timeout
         self.max_body_bytes = max_body_bytes
         self._lock = threading.RLock()
@@ -67,6 +69,8 @@ class RequestGovernor:
         self._started = 0
         self._completed = 0
         self._skipped = 0
+        self._origin_started: dict[str, int] = {}
+        self._origin_locks: dict[str, threading.Lock] = {}
         self._cache: dict[str, Evidence] = {}
         self._robots: dict[str, tuple[bool, urllib.robotparser.RobotFileParser | None, str]] = {}
         self._robots_inflight: dict[str, threading.Event] = {}
@@ -76,15 +80,20 @@ class RequestGovernor:
     def remaining_seconds(self) -> float:
         return max(0.0, self.deadline - time.monotonic())
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self, url: str | None = None) -> dict[str, Any]:
         with self._lock:
-            return {
+            result = {
                 "requests_started": self._started,
                 "requests_completed": self._completed,
                 "requests_skipped": self._skipped,
                 "remaining_requests": max(0, self.max_requests - self._started),
                 "remaining_deadline_seconds": round(self.remaining_seconds(), 3),
             }
+            if url:
+                origin = self._origin(self.normalize_url(url))
+                result["remaining_origin_requests"] = max(
+                    0, self.max_per_origin - self._origin_started.get(origin, 0))
+            return result
 
     @staticmethod
     def normalize_url(url: str) -> str:
@@ -120,7 +129,7 @@ class RequestGovernor:
             if not address.is_global:
                 raise UnsafeTarget("private, loopback, link-local, or reserved targets are blocked")
 
-    def _reserve(self) -> float:
+    def _reserve(self, url: str) -> float:
         with self._lock:
             remaining = self.remaining_seconds()
             if remaining <= 0:
@@ -129,11 +138,16 @@ class RequestGovernor:
             if self._started >= self.max_requests:
                 self._skipped += 1
                 raise LimitError("request budget exhausted")
+            origin = self._origin(url)
+            if self._origin_started.get(origin, 0) >= self.max_per_origin:
+                self._skipped += 1
+                raise LimitError("per-origin request budget exhausted")
             self._started += 1
+            self._origin_started[origin] = self._origin_started.get(origin, 0) + 1
             return min(self.timeout, remaining)
 
     def _request_once(self, url: str, *, body_limit: int | None = None) -> Evidence:
-        timeout = self._reserve()
+        timeout = self._reserve(url)
         self._assert_public(url)
         req = urllib.request.Request(url, headers={
             "User-Agent": USER_AGENT,
@@ -142,19 +156,24 @@ class RequestGovernor:
         })
         limit = body_limit or self.max_body_bytes
         try:
+            origin = self._origin(url)
+            with self._lock:
+                origin_lock = self._origin_locks.setdefault(origin, threading.Lock())
             with self._semaphore:
-                try:
-                    response = self._opener.open(req, timeout=timeout)
-                except urllib.error.HTTPError as exc:
-                    response = exc
-                status = getattr(response, "status", response.getcode())
-                headers = {k.lower(): v for k, v in response.headers.items()}
-                body = response.read(limit + 1)
-                if len(body) > limit:
-                    body = body[:limit]
-                    detail = f"body truncated at {limit} bytes"
-                else:
-                    detail = ""
+                # One origin is always serialized, including robots and redirect hops.
+                with origin_lock:
+                    try:
+                        response = self._opener.open(req, timeout=timeout)
+                    except urllib.error.HTTPError as exc:
+                        response = exc
+                    status = getattr(response, "status", response.getcode())
+                    headers = {k.lower(): v for k, v in response.headers.items()}
+                    body = response.read(limit + 1)
+                    if len(body) > limit:
+                        body = body[:limit]
+                        detail = f"body truncated at {limit} bytes"
+                    else:
+                        detail = ""
             outcome = "ok" if 200 <= status < 300 else "http-error"
             return Evidence(url, url, status, headers, body, [], outcome, detail)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:

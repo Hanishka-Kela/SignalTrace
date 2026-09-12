@@ -28,6 +28,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("site", nargs="?", help="public HTTP(S) target")
     parser.add_argument("--max-requests", type=int, default=12)
     parser.add_argument("--max-concurrency", type=int, default=3)
+    parser.add_argument("--max-per-origin", type=int, default=6)
     parser.add_argument("--deadline", type=float, default=30.0)
     parser.add_argument("--timeout", type=float, default=8.0)
     parser.add_argument("--max-body-bytes", type=int, default=1_500_000)
@@ -140,6 +141,7 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
         timeout=max(.1, min(args.timeout, 60.0)),
         max_body_bytes=max(1024, min(args.max_body_bytes, 10_000_000)),
         deadline_seconds=max(.1, min(args.deadline, 300.0)),
+        max_per_origin=max(2, min(args.max_per_origin, 50)),
     )
     requested_site = str(payload["site"])
     findings: list[dict[str, Any]] = []
@@ -278,6 +280,7 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
             "requests_skipped": snapshot["requests_skipped"],
             "checks_completed": [name for name in CHECKS if name in set(completed)],
             "checks_unresolved": list(dict.fromkeys(unresolved)),
+            "unresolved_checks": list(dict.fromkeys(unresolved)),
         },
         "findings": findings,
         "suggested_actions": actions,

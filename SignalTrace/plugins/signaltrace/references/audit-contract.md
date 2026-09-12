@@ -6,7 +6,15 @@ Read this reference when coordinating specialists, constructing findings, compar
 
 SignalTrace is read-only. Fetch only public HTTP(S) URLs named by the audit input or links actually observed in cached evidence. Do not guess paths. Do not use browser automation, credentials, alternate user-agents, hostname aliases, query mutations, or retries to evade a denial. All network access belongs to the shared request governor; specialist code must not open sockets directly.
 
-Start the monotonic global deadline before DNS or network activity. A request consumes budget when it starts, whether it succeeds or fails. Check `robots.txt` before the first non-robots request to each origin. A denied URL stays denied for the audit. Redirects are evidence and each redirect target is separately normalized, deduplicated, budgeted, and robots-checked.
+Start the monotonic global deadline before DNS or network activity. A request consumes global and per-origin budget when it starts, whether it succeeds or fails. Check `robots.txt` before the first non-robots request to each origin. Serialize all requests to the same origin. A denied URL stays denied for the audit. Redirects are evidence and each redirect target is separately normalized, deduplicated, budgeted, and robots-checked.
+
+## Optional delegation contract
+
+Delegation is an optimization, never a dependency. When no subagent facility exists, run every specialist locally against the same cached evidence. If delegation exists, create a specialist only for a concrete missing evidence dependency: one selected final destination, one named external source, one linked policy page, or one alternate representation. A finding by itself is not a reason to delegate, and ordinary analysis always uses the cache.
+
+Every delegated task must contain `task_identifier`, `cached_evidence_references`, `permission_status`, `remaining_global_request_budget`, `remaining_per_origin_budget`, `remaining_time`, `maximum_additional_requests`, and `cancellation_deadline`. Give the worker analysis data, not crawl authority. A worker may not call curl, built-in fetch, `urllib`, or another network tool. If one extra request is explicitly granted, the entrypoint executes it through its governor and returns the resulting cache reference; the worker still does not fetch directly.
+
+Keep local work running while independent tasks execute. Never schedule two network fetches to the same origin concurrently. At the cancellation deadline, cancel or ignore unfinished work, emit no finding based on partial output, and append the task identifier to both `coverage.checks_unresolved` and its compatibility alias `coverage.unresolved_checks`. Never wait indefinitely.
 
 ## Claim scope
 

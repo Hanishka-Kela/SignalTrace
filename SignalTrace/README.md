@@ -40,11 +40,11 @@ Useful limits:
 
 ```bash
 python3 plugins/signaltrace/scripts/signaltrace.py \
-  --max-requests 12 --max-concurrency 3 --deadline 30 \
+  --max-requests 12 --max-per-origin 6 --max-concurrency 3 --deadline 30 \
   --timeout 8 --max-body-bytes 1500000 https://example.com/
 ```
 
-The request count includes `robots.txt`. Redirects are followed manually, each new origin is checked first, URLs are deduplicated, private/reserved network targets are rejected, and a denial is never retried through an alternate identity or URL. `robots.txt` 401/403, redirects, malformed responses, or temporary failures are treated as unavailable/denied; 404/410 means no policy was published.
+The request count and per-origin count include `robots.txt`. Redirects are followed manually, each new origin is checked first, same-origin requests are serialized, URLs are deduplicated, private/reserved network targets are rejected, and a denial is never retried through an alternate identity or URL. `robots.txt` 401/403, redirects, malformed responses, or temporary failures are treated as unavailable/denied; 404/410 means no policy was published.
 
 Source verification is intentionally opt-in: only URLs explicitly provided in `sources` are fetched. If none are provided, that check reports `not assessed` through coverage rather than inventing corroboration.
 
