@@ -26,6 +26,13 @@ _TRACKING_PARAMETER_NAMES = {
     "product_name", "storecontext",
 }
 
+# Known-incomplete tracker signatures; this is not a full tracker database.
+_TRACKING_IMAGE_HOSTS = {
+    "px.ads.linkedin.com", "google-analytics.com", "www.google-analytics.com",
+    "doubleclick.net", "www.doubleclick.net",
+}
+_TRACKING_IMAGE_PATHS = ("/pixel", "/collect", "/beacon", "/tr")
+
 
 def canonicalize_url(url: str) -> str:
     """Remove known tracking-only query parameters while preserving page scope."""
@@ -51,6 +58,25 @@ def _canonicalize_url_fields(value: Any) -> Any:
     if isinstance(value, list):
         return [_canonicalize_url_fields(item) for item in value]
     return value
+
+
+def _is_tracking_image(image: dict[str, str]) -> bool:
+    src = str(image.get("src") or "")
+    parts = urllib.parse.urlsplit(src)
+    host = (parts.hostname or "").casefold()
+    path = parts.path.casefold()
+    known_host = host in _TRACKING_IMAGE_HOSTS or any(
+        host.endswith("." + domain) for domain in _TRACKING_IMAGE_HOSTS)
+    known_path = any(path == marker or path.startswith(marker + "/")
+                     for marker in _TRACKING_IMAGE_PATHS)
+    if known_host and (known_path or host in _TRACKING_IMAGE_HOSTS):
+        return True
+
+    def trivial_dimension(value: str) -> bool:
+        match = re.fullmatch(r"\s*(\d+)\s*(?:px)?\s*", str(value or ""), re.I)
+        return bool(match and int(match.group(1)) <= 2)
+
+    return trivial_dimension(image.get("width", "")) and trivial_dimension(image.get("height", ""))
 
 
 def finding(*, code: str, title: str, severity: str, confidence: float,
@@ -161,7 +187,7 @@ class PageParser(HTMLParser):
             if attrs.get("href"):
                 self.canonicals.append(urllib.parse.urljoin(self.base_url, attrs["href"]))
         if tag == "img":
-            self.images.append({k: attrs.get(k, "") for k in ("src", "alt", "title")})
+            self.images.append({k: attrs.get(k, "") for k in ("src", "alt", "title", "width", "height")})
             # Alternative text may label an enclosing link without becoming
             # ordinary rendered page copy.
             if attrs.get("alt"):
@@ -439,7 +465,9 @@ def content_engagement_audit(page: PageParser, url: str) -> tuple[list[dict], li
             impact="A text-only consumer receives an app shell or very thin representation instead of a supported answer.",
             suggested_action="Include the page's primary answer and entity identity in the initial HTML while retaining progressive enhancement.",
             priority=75))
-    image_facts = [img for img in page.images if not img.get("alt") and (img.get("src") or img.get("title"))]
+    image_facts = [img for img in page.images
+                   if not _is_tracking_image(img)
+                   and not img.get("alt") and (img.get("src") or img.get("title"))]
     if word_count < 40 and image_facts and not page.headings:
         findings.append(finding(
             code="image-only-evidence", title="Primary representation appears image-dependent without text alternatives",

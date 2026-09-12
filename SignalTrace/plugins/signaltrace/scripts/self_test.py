@@ -74,6 +74,27 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(malformed["evidence"]["block"], 2)
         self.assertIn("line", malformed["evidence"])
 
+    def test_graph_wrapped_organization_name_satisfies_schema_minimum(self):
+        page = parse_page(
+            '<script type="application/ld+json">{"@graph":[{"@type":"Organization",'
+            '"name":"Example Store"}]}</script>', "https://example.com/")
+        findings, _ = structured_data_audit(page, page.base_url)
+        self.assertFalse(any(item["_code"] == "schema-minimum-organization"
+                             for item in findings))
+
+    def test_tracking_pixel_is_excluded_but_content_image_is_not(self):
+        pixel_page = parse_page(
+            '<img src="https://px.ads.linkedin.com/collect/?pid=3332458&fmt=gif" '
+            'width="1" height="1">', "https://example.com/")
+        pixel_findings, _ = content_engagement_audit(pixel_page, pixel_page.base_url)
+        self.assertFalse(any(item["_code"] == "image-only-evidence" for item in pixel_findings))
+
+        content_page = parse_page(
+            '<img src="https://cdn.example.com/product.jpg" width="800" height="600">',
+            "https://example.com/")
+        content_findings, _ = content_engagement_audit(content_page, content_page.base_url)
+        self.assertTrue(any(item["_code"] == "image-only-evidence" for item in content_findings))
+
     def test_microdata_without_jsonld_is_not_failure(self):
         page = parse_page("<div itemscope itemtype='https://schema.org/Product'><span itemprop='name'>A</span></div>",
                           "https://example.com/a")
