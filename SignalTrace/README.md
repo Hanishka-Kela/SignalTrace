@@ -64,7 +64,7 @@ After the target is fetched, SignalTrace classifies only links present in that c
 
 A missing robots.txt means no published robots policy was found. SignalTrace continues only within its bounded, polite audit limits. It does not treat absence as unrestricted authorization. HTTP 404 retains the normal bounded journey sample. A timeout, fetch failure, 5xx, access error, or unparseable robots response is reported as `unavailable` and uses a reduced conservative sample. A 403, 429, repeated 5xx, or explicit anti-bot page response stops further requests to that origin without being reported as a robots denial.
 
-Source verification is intentionally opt-in: only URLs explicitly provided in `sources` are fetched. If none are provided, that check reports `not assessed` through coverage rather than inventing corroboration.
+Source verification is intentionally opt-in and dormant on a bare URL invocation: the specialist activates only when the caller supplies a `claims`/`sources` JSON envelope. If neither is provided, coverage says the check did not execute; it never searches broadly or invents corroboration.
 
 ## Input contract
 
@@ -73,6 +73,8 @@ The CLI accepts either a positional URL or one stdin JSON object. Positional URL
 - `site` (required): public `http` or `https` URL.
 - `sources` (optional): targeted external evidence URLs.
 - `claims` (optional): scoped claim objects using the fields in `references/audit-contract.md`.
+
+Without a stdin envelope, source verification remains dormant and no external source URLs are fetched.
 
 Every audit is read-only: SignalTrace does not modify a live website, submit forms, or trigger site actions. Requests remain bounded, politely spaced, and robots.txt-aware under the shared governor.
 

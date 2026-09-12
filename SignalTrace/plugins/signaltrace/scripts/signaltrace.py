@@ -172,10 +172,18 @@ _PROHIBITED_GENERATED_LANGUAGE = re.compile(
 def _enforce_evidence_bounded_language(items: list[dict[str, Any]]) -> None:
     """Fail closed to cautious language without altering quoted evidence."""
     for item in items:
-        for field in ("title", "reason", "action", "impact", "suggested_action"):
+        for field in ("title", "reason", "action", "impact"):
             value = item.get(field)
             if isinstance(value, str) and _PROHIBITED_GENERATED_LANGUAGE.search(value):
                 item[field] = (
+                    "The fetched evidence establishes the reported condition; behavioral impact was not measured."
+                    if item.get("is_finding") else
+                    "Consider addressing the observed condition; behavioral impact was not measured."
+                )
+        action = item.get("suggested_action")
+        if isinstance(action, dict) and isinstance(action.get("summary"), str):
+            if _PROHIBITED_GENERATED_LANGUAGE.search(action["summary"]):
+                action["summary"] = (
                     "The fetched evidence establishes the reported condition; behavioral impact was not measured."
                     if item.get("is_finding") else
                     "Consider addressing the observed condition; behavioral impact was not measured."
@@ -225,6 +233,13 @@ def _input(args: argparse.Namespace) -> dict[str, Any]:
         if key in payload and not isinstance(payload[key], list):
             raise ValueError(f"{key} must be an array")
     return payload
+
+
+def _source_verification_state(payload: dict[str, Any]) -> tuple[str, str]:
+    if not payload.get("claims") and not payload.get("sources"):
+        return ("not executed: optional claims/sources envelope absent",
+                "source-verification: did not execute; no external claims or sources were supplied for this run")
+    return "supplied evidence not independently verified", ""
 
 
 def _is_html(evidence: Evidence) -> bool:
@@ -667,19 +682,27 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
                     unresolved.append(note)
             except Exception as exc:
                 unresolved.append(f"source-verification: fetch did not complete: {exc}")
-    found, notes = source_verification(payload.get("claims", []), source_pages, target_url)
-    findings.extend(found)
-    unresolved.extend(notes)
+    supplied_claims = payload.get("claims", [])
+    supplied_sources = payload.get("sources", [])
+    source_verification_status, dormant_note = _source_verification_state(payload)
+    if dormant_note:
+        unresolved.append(dormant_note)
+    else:
+        found, notes = source_verification(supplied_claims, source_pages, target_url)
+        findings.extend(found)
+        unresolved.extend(notes)
+        source_verification_status = "assessed" if source_pages else "supplied evidence not independently verified"
     completed.append("source-verification")
     return _report(site, governor, findings, completed, unresolved, opportunities,
-                   journey_coverage, same_as_coverage)
+                   journey_coverage, same_as_coverage, source_verification_status)
 
 
 def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]],
             completed: list[str], unresolved: list[str],
             opportunities: list[dict[str, Any]] | None = None,
             journey_coverage: dict[str, list[dict[str, Any]]] | None = None,
-            same_as_coverage: dict[str, Any] | None = None) -> dict[str, Any]:
+            same_as_coverage: dict[str, Any] | None = None,
+            source_verification_status: str = "not assessed") -> dict[str, Any]:
     opportunities = opportunities or []
     findings, opportunities = _separate_static_risks(findings, opportunities)
     _annotate_result_evidence(findings)
@@ -734,6 +757,7 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
                 "selected_links": [], "crawled_links": [], "skipped_links": []},
             "sameAs_identity": same_as_coverage or {
                 "status": "not assessed", "declared": 0, "results": []},
+            "source_verification": {"status": source_verification_status},
         },
         "findings": findings,
         "suggested_actions": opportunities,

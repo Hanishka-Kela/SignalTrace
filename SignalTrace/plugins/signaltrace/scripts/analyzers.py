@@ -86,6 +86,9 @@ def finding(*, code: str, title: str, severity: str, confidence: float,
     affected_url = canonicalize_url(affected_url)
     evidence = _canonicalize_url_fields(evidence)
     stable = "|".join((code, affected_url, json.dumps(evidence, sort_keys=True)))
+    action_priority = ("critical" if priority >= 95 else
+                       "high" if priority >= 80 else
+                       "medium" if priority >= 60 else "low")
     return {
         "id": "ST-" + hashlib.sha256(stable.encode()).hexdigest()[:10].upper(),
         "title": title,
@@ -96,7 +99,7 @@ def finding(*, code: str, title: str, severity: str, confidence: float,
         "evidence_type": evidence_type,
         "responsible_party": responsible_party,
         "impact": impact,
-        "suggested_action": suggested_action,
+        "suggested_action": {"summary": suggested_action, "priority": action_priority},
         "priority": priority,
         "coverage_status": coverage_status,
         "is_finding": True,
@@ -1005,6 +1008,46 @@ def improvement_opportunity_audit(page: PageParser, url: str,
             reason="No JSON-LD, Microdata, or RDFa was observed in the fetched HTML.",
             url=url, source=evidence_source, observed="No machine-readable metadata detected",
             confidence="certain"))
+
+    parsed_nodes, _ = parsed_jsonld_nodes(page)
+    product_or_service_nodes = [node for _, node in parsed_nodes
+                                if _types(node).intersection({"product", "service"})]
+    for node in product_or_service_nodes:
+        missing = [field for field in ("aggregateRating", "review")
+               if field not in node or node.get(field) in (None, "")]
+        if missing:
+            items.append(opportunity(
+                rule_id="opportunity-structured-review-signals", priority="low",
+                category="discoverability",
+                action="Add supported AggregateRating or Review properties when verified evidence exists.",
+                reason="A Product or Service JSON-LD entity was observed without one or more review signal properties.",
+                url=url, source=evidence_source,
+                observed={"type": node.get("@type"), "id": node.get("@id"), "missing": missing},
+                confidence="likely"))
+            break
+
+    organization_nodes = [node for _, node in parsed_nodes if "organization" in _types(node)]
+    if organization_nodes and not any(node.get("sameAs") for node in organization_nodes):
+        items.append(opportunity(
+            rule_id="opportunity-organization-sameas", priority="low",
+            category="discoverability",
+            action="Declare verified social or profile links in Organization JSON-LD when available.",
+            reason="An Organization JSON-LD entity was observed without a sameAs property.",
+            url=url, source=evidence_source,
+            observed={"organization_types": [node.get("@type") for node in organization_nodes],
+                      "missing": ["sameAs"]}, confidence="likely"))
+
+    faq_pattern = re.compile(r"\b(?:q(?:uestion)?|a(?:nswer)?)\s*[:\-]|\?", re.I)
+    faq_visible = bool(faq_pattern.search(page.visible_text)) or sum(
+        1 for heading in page.headings if "?" in heading.get("text", "")) >= 2
+    has_faq_schema = any("faqpage" in _types(node) for _, node in parsed_nodes)
+    if faq_visible and not has_faq_schema:
+        items.append(opportunity(
+            rule_id="opportunity-faq-schema", priority="low", category="discoverability",
+            action="Add FAQPage structured data for the observed question-and-answer content when it meets the format requirements.",
+            reason="Question-and-answer patterns were observed in readable HTML without an FAQPage JSON-LD node.",
+            url=url, source=evidence_source,
+            observed="Visible question-and-answer pattern; FAQPage schema not observed", confidence="likely"))
 
     factual_images = []
     for image in page.images:

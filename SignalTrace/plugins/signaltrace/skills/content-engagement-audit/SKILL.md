@@ -10,4 +10,6 @@ Analyze only cached representations and read [the shared contract](../../referen
 
 Script-to-text ratio and hydration markers are diagnostics, never standalone findings. Introductory copy is not itself defective. Static markup cannot prove mobile or visual-design behavior, user confusion, abandonment, bounce, conversion loss, or sales effects. Do not infer demand, inventory accuracy, sales velocity, user psychology, or broken JavaScript. Classify absent labels, continuations, recovery routes, and readable media equivalents as suggested opportunities unless a separate directly demonstrated defect applies. Do not report a missing notification path when a waitlist, notification, alternative, or relevant recovery route is present.
 
+The JavaScript-rendering-gap detector identifies the symptom of near-empty initial HTML that a non-rendering crawler cannot read. It reports this as a suggested opportunity, not a confirmed finding, because static fetching cannot prove whether client-side rendering recovers the content for a real crawler.
+
 Return exact excerpts or element evidence and remain within the supplied bounded task. Any additional fetch must use the entrypoint's governor.

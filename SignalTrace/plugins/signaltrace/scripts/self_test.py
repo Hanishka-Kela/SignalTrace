@@ -28,7 +28,7 @@ from config import DEFAULTS, USER_AGENT
 from scope import compare_scopes, normalize_scope
 from signaltrace import (
     _audit_same_as, _consolidate_opportunities, _journey_sample_limit, _report,
-    _select_journey_links,
+    _select_journey_links, _source_verification_state,
 )
 
 
@@ -53,6 +53,55 @@ class ScopeTests(unittest.TestCase):
 
 
 class AnalyzerTests(unittest.TestCase):
+    def test_findings_use_object_suggested_actions(self):
+        findings, _ = structured_data_audit(
+            parse_page('<script type="application/ld+json">{"@type":"Organization"}</script>',
+                       "https://example.com/"), "https://example.com/")
+        self.assertTrue(findings)
+        for item in findings:
+            action = item["suggested_action"]
+            self.assertIsInstance(action, dict)
+            self.assertTrue(action["summary"])
+            self.assertIn(action["priority"], {"critical", "high", "medium", "low"})
+
+    def test_bare_url_source_verification_is_not_executed(self):
+        status, note = _source_verification_state({"site": "https://example.com/"})
+        self.assertIn("not executed", status)
+        self.assertIn("did not execute", note)
+        self.assertNotIn("no suitable independent source", note)
+
+    def test_proactive_structured_opportunities_require_positive_evidence(self):
+        page = parse_page(
+            '<script type="application/ld+json">'
+            '{"@type":"Product","name":"Widget"}</script>'
+            '<script type="application/ld+json">'
+            '{"@type":"Organization","name":"Acme"}</script>', "https://example.com/")
+        ids = {item["id"] for item in improvement_opportunity_audit(page, page.base_url)}
+        self.assertIn("opportunity-structured-review-signals", ids)
+        self.assertIn("opportunity-organization-sameas", ids)
+
+    def test_proactive_structured_opportunities_stay_silent_without_triggers(self):
+        page = parse_page(
+            '<script type="application/ld+json">'
+            '{"@type":"Product","name":"Widget","aggregateRating":{},"review":{}} </script>'
+            '<script type="application/ld+json">'
+            '{"@type":"Organization","name":"Acme",'
+            '"sameAs":["https://social.example/acme"]}</script>'
+            '<script type="application/ld+json">{"@type":"FAQPage"}</script>',
+            "https://example.com/")
+        page_html = page.visible_text
+        self.assertEqual(page_html, "")
+        ids = {item["id"] for item in improvement_opportunity_audit(page, page.base_url)}
+        self.assertNotIn("opportunity-structured-review-signals", ids)
+        self.assertNotIn("opportunity-organization-sameas", ids)
+        self.assertNotIn("opportunity-faq-schema", ids)
+
+    def test_visible_questions_without_faq_schema_get_proactive_opportunity(self):
+        page = parse_page("<h2>What is Widget?</h2><p>Widget is useful.</p>"
+                          "<h2>Where is Widget used?</h2><p>At home.</p>",
+                          "https://example.com/")
+        ids = {item["id"] for item in improvement_opportunity_audit(page, page.base_url)}
+        self.assertIn("opportunity-faq-schema", ids)
     def test_conflicting_bot_directives_are_localized(self):
         page = parse_page("<meta name='robots' content='index, noindex'><p>Answer</p>",
                           "https://example.com")
