@@ -232,6 +232,16 @@ def _is_html(evidence: Evidence) -> bool:
     return bool(evidence.body) and (media_type in {"", "text/html", "application/xhtml+xml"})
 
 
+_AUTH_GATED_PATHS = {
+    "/account", "/login", "/signin", "/cart", "/checkout", "/wishlist",
+}
+
+
+def _is_auth_gated_url(url: str) -> bool:
+    path = urllib.parse.urlsplit(url).path.rstrip("/").casefold() or "/"
+    return path in _AUTH_GATED_PATHS or path.startswith("/account/")
+
+
 def _select_journey_links(page, target_url: str, limit: int) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Choose at most one same-origin target-page link per journey role."""
     origin = urllib.parse.urlsplit(target_url).netloc.casefold()
@@ -259,6 +269,9 @@ def _select_journey_links(page, target_url: str, limit: int) -> tuple[list[dict[
         seen.add(url)
         if parts.netloc.casefold() != origin:
             skipped.append({"url": url, "reason": "cross-origin link outside journey sample"})
+            continue
+        if _is_auth_gated_url(url):
+            skipped.append({"url": url, "reason": "auth-gated URL excluded from content journey sample"})
             continue
         candidate = dict(link)
         candidate["url"] = url

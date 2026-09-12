@@ -814,6 +814,31 @@ class VisitorJourneyTests(unittest.TestCase):
         findings, _ = destination_observation(link, landing.base_url, evidence, None)
         self.assertEqual(findings[0]["severity"], "High")
 
+    def test_auth_gated_journey_links_are_excluded_from_role_sampling(self):
+        landing = parse_page(
+            "<a href='/account/wishlist'><span>Wishlist</span></a>",
+            "https://shop.example/")
+        selected, skipped = _select_journey_links(landing, landing.base_url, 5)
+        self.assertFalse(selected)
+        self.assertTrue(any(
+            item["reason"] == "auth-gated URL excluded from content journey sample"
+            for item in skipped))
+
+    def test_thin_public_page_still_gets_empty_and_detail_opportunities(self):
+        landing = parse_page("<a href='/broken'>Broken page</a>", "https://shop.example/")
+        link = next(item for item in landing.links if item["url"].endswith("/broken"))
+        broken = parse_page("<title>Broken page</title>", link["url"])
+        evidence = Evidence(link["url"], link["url"], 200,
+                            {"content-type": "text/html"}, b"", [], "ok")
+        findings, _ = destination_observation(link, landing.base_url, evidence, broken)
+        self.assertTrue(any(item["_code"] == "destination-empty" for item in findings))
+        _, opportunities, _ = visitor_journey_audit(landing, landing.base_url, [{
+            "role": "detail", "url": link["url"], "page": broken, "link": link,
+        }])
+        opportunity_ids = {item["id"] for item in opportunities}
+        self.assertIn("opportunity-detail-facts", opportunity_ids)
+        self.assertIn("opportunity-detail-continuation", opportunity_ids)
+
     def test_out_of_stock_without_route_and_waitlist_negative_control(self):
         no_route = parse_page(
             "<h1>Widget</h1><p>Out of stock.</p><a href='/'>Home</a>",
