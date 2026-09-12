@@ -78,6 +78,18 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(first["evidence"]["script_characters"], 139578)
         self.assertEqual(second["evidence"]["script_characters"], 139580)
 
+    def test_finding_id_changes_when_identity_evidence_changes(self):
+        common = dict(code="initial-html-answer-empty", title="Thin HTML",
+                      severity="Medium", confidence=.9,
+                      affected_url="https://example.com/", evidence_type="initial-html",
+                      responsible_party="site-published link", impact="Thin.",
+                      suggested_action="Add readable content.", priority=75)
+        first = finding(evidence={"readable_word_count": 6, "script_characters": 139578,
+                                  "title": "Example"}, **common)
+        second = finding(evidence={"readable_word_count": 7, "script_characters": 139578,
+                                   "title": "Example"}, **common)
+        self.assertNotEqual(first["id"], second["id"])
+
     def test_bare_url_source_verification_is_not_executed(self):
         status, note = _source_verification_state({"site": "https://example.com/"})
         self.assertIn("not executed", status)

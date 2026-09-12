@@ -60,11 +60,19 @@ def _canonicalize_url_fields(value: Any) -> Any:
     return value
 
 
+_VOLATILE_FINDING_EVIDENCE_FIELDS = {
+    # Inline script length can change on unchanged pages due to server-side
+    # nonces or timestamps; it is diagnostic context, not defect identity.
+    "script_characters",
+}
+
+
 def _finding_identity_evidence(value: Any) -> Any:
-    """Remove volatile diagnostic-only fields from stable finding identity."""
+    """Remove explicitly volatile diagnostic fields from stable identity."""
     if isinstance(value, dict):
         return {key: _finding_identity_evidence(item)
-                for key, item in value.items() if key != "script_characters"}
+                for key, item in value.items()
+                if key not in _VOLATILE_FINDING_EVIDENCE_FIELDS}
     if isinstance(value, list):
         return [_finding_identity_evidence(item) for item in value]
     return value
