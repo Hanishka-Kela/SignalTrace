@@ -151,6 +151,7 @@ class ImprovementOpportunityTests(unittest.TestCase):
         item = next(value for value in opportunities if value["id"] == "opportunity-recovery-path")
         self.assertEqual(item["priority"], "high")
         self.assertEqual(item["evidence"]["observed"].casefold(), "currently unavailable")
+        self.assertEqual(opportunities[0]["id"], "opportunity-recovery-path")
 
     def test_opportunity_contract_and_deduplication(self):
         page = parse_page("<p>Plain answer.</p>", "https://example.com/")
@@ -234,7 +235,7 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(len(marketplace["skills"]), 6)
         entrypoints = [item for item in marketplace["skills"] if item.get("entrypoint") is True]
         self.assertEqual([item["id"] for item in entrypoints], ["audit-entrypoint"])
-        self.assertEqual(len({item["id"] for item in marketplace["skills"]}), 5)
+        self.assertEqual(len({item["id"] for item in marketplace["skills"]}), 6)
         for item in marketplace["skills"]:
             self.assertTrue((root / item["path"] / "SKILL.md").is_file(), item["path"])
 
