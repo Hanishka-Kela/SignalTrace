@@ -17,7 +17,7 @@ from analyzers import (
     deduplicate_opportunities, destination_observation, improvement_opportunity_audit,
     parse_page, source_verification, structured_data_audit, visitor_journey_audit,
 )
-from runtime import Evidence, RequestGovernor
+from runtime import Evidence, LimitError, RequestGovernor
 from config import DEFAULTS, USER_AGENT
 from scope import compare_scopes, normalize_scope
 from signaltrace import _select_journey_links
@@ -340,7 +340,7 @@ class RuntimeTests(unittest.TestCase):
                             b"User-agent: *\nAllow: /\n" if kind == "robots" else b"ok", [], "ok")
         governor._curl_once = fake_curl  # type: ignore[method-assign]
         governor.fetch("https://example.com/a")
-        with self.assertRaises(Exception):
+        with self.assertRaises(LimitError):
             governor.fetch("https://example.com/b")
         self.assertEqual(governor.snapshot()["requests_started"], 2)
         self.assertGreaterEqual(starts[1] - starts[0], .018)

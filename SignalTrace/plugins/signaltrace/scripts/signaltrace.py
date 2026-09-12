@@ -131,9 +131,9 @@ def _select_journey_links(page, target_url: str, limit: int) -> tuple[list[dict[
     selected: list[dict[str, str]] = []
     target_path = urllib.parse.urlsplit(target_url).path.rstrip("/")
     candidates["navigation"].sort(key=lambda item: (
-        0 if ("/category/" in urllib.parse.urlsplit(item["url"]).path.casefold() or
-              urllib.parse.urlsplit(item["url"]).path.startswith(target_path + "/")) else 1,
-        0 if item.get("section") in {"nav", "header"} else 1))
+        0 if "/category/" in urllib.parse.urlsplit(item["url"]).path.casefold()
+        else 1 if target_path and urllib.parse.urlsplit(item["url"]).path.startswith(target_path + "/")
+        else 2 if item.get("section") in {"nav", "header"} else 3,))
     candidates["detail"].sort(key=lambda item: (
         0 if any(token in urllib.parse.urlsplit(item["url"]).path.casefold()
                  for token in ("/product/", "/item/", "/detail/")) else 1,))
