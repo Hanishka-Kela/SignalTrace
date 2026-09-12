@@ -25,7 +25,10 @@ from analyzers import (
 from runtime import Evidence, LimitError, RequestGovernor, RobotsDecision
 from config import DEFAULTS, USER_AGENT
 from scope import compare_scopes, normalize_scope
-from signaltrace import _audit_same_as, _journey_sample_limit, _report, _select_journey_links
+from signaltrace import (
+    _audit_same_as, _consolidate_opportunities, _journey_sample_limit, _report,
+    _select_journey_links,
+)
 
 
 class ScopeTests(unittest.TestCase):
@@ -134,6 +137,22 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(unresolved, [])
         self.assertEqual(declarations[0]["node_type"], "Person")
 
+    def test_graph_wrapped_organization_same_as_is_extracted(self):
+        page = parse_page(
+            '<script type="application/ld+json">'
+            '{"@context":"https://schema.org","@graph":['
+            '{"@type":"WebSite","name":"Acme"},'
+            '{"@type":"Organization","name":"Acme",'
+            '"sameAs":["https://profiles.example/acme"]}]}</script>',
+            "https://acme.example/")
+        declarations, unresolved, status = same_as_declarations(page, page.base_url)
+        self.assertEqual(status, "applicable")
+        self.assertEqual(unresolved, [])
+        self.assertEqual(declarations, [{
+            "url": "https://profiles.example/acme", "brand": "Acme", "block": 1,
+            "node_type": "Organization",
+        }])
+
     def test_same_as_robots_denial_is_coverage_only(self):
         declaration = {"url": "https://social.example/acme", "brand": "Acme",
                        "node_type": "Organization", "block": 1}
@@ -213,6 +232,43 @@ class AnalyzerTests(unittest.TestCase):
 
 
 class ImprovementOpportunityTests(unittest.TestCase):
+    def test_same_cause_cross_page_opportunities_are_consolidated(self):
+        first = opportunity(
+            rule_id="opportunity-control-labels", priority="high", category="engagement",
+            action="Expose a programmatic label.", reason="No static name was observed.",
+            url="https://example.com/collections/bags", source="initial HTML",
+            observed=[{"tag": "button", "occurrence_count": 2}], confidence="certain")
+        second = opportunity(
+            rule_id="opportunity-control-labels", priority="high", category="engagement",
+            action="Expose a programmatic label.", reason="No static name was observed.",
+            url="https://example.com/pages/help", source="sampled internal page",
+            observed=[{"tag": "button", "occurrence_count": 1}], confidence="certain")
+        for item in (first, second):
+            item["evidence"]["check_performed"] = "opportunity-control-labels"
+            item["evidence"]["not_verified"] = "Behavioral impact was not measured."
+        merged = _consolidate_opportunities([second, first], "https://example.com/")
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["id"], "opportunity-control-labels")
+        pages = merged[0]["evidence"]["observed"]
+        self.assertEqual([item["url"] for item in pages], [
+            "https://example.com/collections/bags", "https://example.com/pages/help"])
+        self.assertEqual([item["occurrence_count"] for item in pages], [2, 1])
+
+    def test_different_cause_opportunities_are_not_consolidated(self):
+        controls = opportunity(
+            rule_id="opportunity-control-labels", priority="high", category="engagement",
+            action="Expose a programmatic label.", reason="No static name was observed.",
+            url="https://example.com/a", source="initial HTML", observed="button",
+            confidence="certain")
+        navigation = opportunity(
+            rule_id="opportunity-navigation-labels", priority="medium", category="navigation",
+            action="Use descriptive navigation labels.", reason="An empty link was observed.",
+            url="https://example.com/b", source="sampled internal page", observed="link",
+            confidence="certain")
+        merged = _consolidate_opportunities([controls, navigation], "https://example.com/")
+        self.assertEqual(len(merged), 2)
+        self.assertEqual({item["id"] for item in merged}, {
+            "opportunity-control-labels", "opportunity-navigation-labels"})
     def test_missing_structured_data_is_opportunity_not_finding(self):
         page = parse_page("<html><head><title>About</title></head><body><h1>About</h1><p>Useful answer.</p></body></html>",
                           "https://example.com/")
@@ -666,6 +722,13 @@ class VisitorJourneyTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_report_uses_only_canonical_checks_unresolved_key(self):
+        report = _report(
+            "https://example.com/", RequestGovernor(spacing_seconds=0), [], [],
+            ["fixture: not assessed"])
+        self.assertEqual(report["coverage"]["checks_unresolved"], ["fixture: not assessed"])
+        self.assertNotIn("unresolved_checks", report["coverage"])
+
     def test_robots_denial_prevents_page_request(self):
         governor = RequestGovernor(max_requests=3, max_concurrency=1, timeout=1,
                                    max_body_bytes=1000, deadline_seconds=3, max_per_origin=3,

@@ -74,12 +74,71 @@ def _annotate_result_evidence(items: list[dict[str, Any]]) -> None:
     """Record the performed check and the shared interpretation boundary."""
     for item in items:
         check = item.get("_code") or item.get("id") or item.get("title")
+        role = str(item.get("page_role") or "")
+        if role and isinstance(check, str) and check.endswith(f"-{role}"):
+            check = check[:-(len(role) + 1)]
         evidence = item.get("evidence")
         blocks = evidence if isinstance(evidence, list) else [evidence]
         for block in blocks:
             if isinstance(block, dict):
                 block.setdefault("check_performed", check)
                 block.setdefault("not_verified", BEHAVIORAL_EVIDENCE_LIMIT)
+
+
+def _consolidate_opportunities(items: list[dict[str, Any]], site: str) -> list[dict[str, Any]]:
+    """Merge the same check and root cause across pages into systemic evidence."""
+    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for item in items:
+        evidence = item.get("evidence", {})
+        family = str(evidence.get("check_performed") or item.get("id") or "")
+        key = (family, item.get("category", ""), item.get("action", ""), item.get("reason", ""))
+        grouped.setdefault(key, []).append(item)
+
+    consolidated: list[dict[str, Any]] = []
+    priority_order = {"high": 0, "medium": 1, "low": 2}
+    for key in sorted(grouped):
+        group = grouped[key]
+        urls = {item.get("evidence", {}).get("url", "") for item in group}
+        if len(group) < 2 or len(urls) < 2:
+            consolidated.extend(group)
+            continue
+        family = key[0]
+        representative = min(group, key=lambda item: json.dumps(
+            item, sort_keys=True, separators=(",", ":")))
+        merged = dict(representative)
+        merged["id"] = family
+        merged.pop("page_role", None)
+        pages = []
+        for item in sorted(group, key=lambda value: (
+                value.get("evidence", {}).get("url", ""), value.get("id", ""))):
+            evidence = item["evidence"]
+            observed = evidence.get("observed")
+            if isinstance(observed, list):
+                occurrence_count = sum(
+                    entry.get("occurrence_count", 1) if isinstance(entry, dict) else 1
+                    for entry in observed)
+            else:
+                occurrence_count = 1
+            pages.append({
+                "url": evidence.get("url", ""),
+                "source": evidence.get("source", ""),
+                "observed": observed,
+                "occurrence_count": occurrence_count,
+            })
+        merged["evidence"] = {
+            "url": site,
+            "source": representative["evidence"].get("source", ""),
+            "observed": pages,
+            "check_performed": family,
+            "not_verified": representative["evidence"].get(
+                "not_verified", BEHAVIORAL_EVIDENCE_LIMIT),
+        }
+        merged["priority"] = min(
+            (item["priority"] for item in group), key=lambda value: priority_order[value])
+        merged["confidence"] = "certain" if all(
+            item.get("confidence") == "certain" for item in group) else "likely"
+        consolidated.append(merged)
+    return consolidated
 
 
 _PROHIBITED_GENERATED_LANGUAGE = re.compile(
@@ -589,6 +648,7 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
     findings, opportunities = _separate_static_risks(findings, opportunities)
     _annotate_result_evidence(findings)
     _annotate_result_evidence(opportunities)
+    opportunities = _consolidate_opportunities(opportunities, site)
     _enforce_evidence_bounded_language(findings)
     _enforce_evidence_bounded_language(opportunities)
     findings = deduplicate_findings(findings)
@@ -632,7 +692,6 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
             },
             "checks_completed": [name for name in CHECKS if name in set(completed)],
             "checks_unresolved": list(dict.fromkeys(unresolved)),
-            "unresolved_checks": list(dict.fromkeys(unresolved)),
             "journey": journey_coverage or {
                 "selected_links": [], "crawled_links": [], "skipped_links": []},
             "sameAs_identity": same_as_coverage or {
