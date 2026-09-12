@@ -1,11 +1,12 @@
 ---
 name: audit-entrypoint
 description: Run a complete read-only SignalTrace audit of a public website URL and emit one evidence-backed JSON report. This is the only marketplace entrypoint; use it for end-to-end audits rather than isolated specialist interpretation.
+license: MIT
 ---
 
 # SignalTrace audit entrypoint
 
-Start the global deadline before any DNS or HTTP work. Read [the audit contract](../../references/audit-contract.md) and [bot-directive rules](../../references/bot-directives.md), then run `python3 ../../scripts/signaltrace.py <URL>` from this skill directory, or resolve that script to an absolute path first. If the harness supplies an input envelope, pipe that JSON object to stdin and do not add guessed targets.
+Start the global deadline before any DNS or HTTP work. Read [the audit contract](../../references/audit-contract.md) and [bot-directive rules](../../references/bot-directives.md), then run `python3 ../../scripts/signaltrace.py <URL>` from this skill directory, or resolve that script to an absolute path first. If the harness supplies an input envelope, pipe that JSON object to `python3 ../../scripts/signaltrace.py --input-stdin` and do not add guessed targets.
 
 The script is the authority for robots and bot-directive decisions, request budgets, concurrency, timeouts, redirect handling, body limits, URL deduplication, evidence caching, scope comparison, finding deduplication, severity, and final serialization. Its governor is the only component allowed to execute curl. Do not perform side-channel network requests around it.
 

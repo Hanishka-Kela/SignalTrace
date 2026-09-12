@@ -6,7 +6,7 @@ SignalTrace is a recommendation-only, read-only Agent Skill marketplace package 
 
 ## Package layout
 
-The repository-level `marketplace.json` exposes one local plugin, `plugins/signaltrace`. The plugin contains exactly five Agent Skills. `audit-entrypoint` is the only implicitly invokable entrypoint; the other four skills are bounded specialists used by it.
+The repository-level contest `marketplace.json` declares exactly five Agent Skills. `audit-entrypoint` is its only entrypoint; the other four skills are bounded specialists used by it. `.codex-plugin/plugin.json` remains separate optional Codex package metadata and is not the contest manifest.
 
 ```text
 marketplace.json
@@ -33,7 +33,7 @@ python3 plugins/signaltrace/scripts/signaltrace.py https://example.com/
 Optional bounded evidence can be supplied through a JSON envelope on stdin:
 
 ```bash
-printf '%s' '{"site":"https://example.com/product","sources":["https://publisher.example/review"],"claims":[{"entity":"Widget","predicate":"price","value":"19.99","unit":"USD","region":"US","source_location":"target"}]}' | python3 plugins/signaltrace/scripts/signaltrace.py
+printf '%s' '{"site":"https://example.com/product","sources":["https://publisher.example/review"],"claims":[{"entity":"Widget","predicate":"price","value":"19.99","unit":"USD","region":"US","source_location":"target"}]}' | python3 plugins/signaltrace/scripts/signaltrace.py --input-stdin
 ```
 
 Useful limits:
@@ -52,11 +52,13 @@ Source verification is intentionally opt-in: only URLs explicitly provided in `s
 
 ## Input contract
 
-The CLI accepts either a positional URL or one stdin JSON object:
+The CLI accepts either a positional URL or one stdin JSON object. Positional URL mode never reads stdin, including when stdin is an inherited open pipe. JSON-envelope mode reads stdin only when `--input-stdin` is present.
 
 - `site` (required): public `http` or `https` URL.
 - `sources` (optional): targeted external evidence URLs.
 - `claims` (optional): scoped claim objects using the fields in `references/audit-contract.md`.
+
+Every audit is read-only: SignalTrace does not modify a live website, submit forms, or trigger site actions. Requests remain bounded, politely spaced, and robots.txt-aware under the shared governor.
 
 CLI options override the default resource limits. Exit code `0` means a valid audit report was emitted, including reports where access was denied or the URL is outside the supported public HTTP(S) scope. Exit code `2` is reserved for a missing or malformed input envelope, for which no audit JSON can be constructed.
 

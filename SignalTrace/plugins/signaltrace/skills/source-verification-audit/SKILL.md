@@ -1,6 +1,7 @@
 ---
 name: source-verification-audit
 description: Compare scoped claims against explicitly supplied external evidence sources while preserving independence and qualifiers. Use as a bounded SignalTrace specialist; never search broadly or manufacture corroboration.
+license: MIT
 ---
 
 # Source verification audit

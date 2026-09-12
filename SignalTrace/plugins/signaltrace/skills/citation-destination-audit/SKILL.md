@@ -1,6 +1,7 @@
 ---
 name: citation-destination-audit
 description: Trace a bounded claim-to-link-to-redirect-to-destination chain and test whether the resolved page supports the scoped entity or task. Use as SignalTrace's citation specialist, never as an unrestricted crawler.
+license: MIT
 ---
 
 # Citation destination audit

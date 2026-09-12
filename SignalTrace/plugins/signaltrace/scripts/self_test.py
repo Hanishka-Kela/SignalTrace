@@ -7,6 +7,8 @@ import json
 import pathlib
 import concurrent.futures
 import inspect
+import subprocess
+import sys
 import time
 import unittest
 
@@ -167,24 +169,62 @@ class RuntimeTests(unittest.TestCase):
 
 
 class PackageTests(unittest.TestCase):
-    def test_exactly_five_skills_and_one_entrypoint(self):
-        plugin = pathlib.Path(__file__).resolve().parents[1]
-        skill_files = sorted(plugin.glob("skills/*/SKILL.md"))
-        self.assertEqual(len(skill_files), 5)
-        implicit = []
-        for skill_file in skill_files:
-            config = (skill_file.parent / "agents/openai.yaml").read_text()
-            if "allow_implicit_invocation: true" in config:
-                implicit.append(skill_file.parent.name)
-        self.assertEqual(implicit, ["audit-entrypoint"])
-
-    def test_marketplace_and_manifest_paths(self):
+    def test_contest_manifest_has_five_skills_one_entrypoint_and_valid_paths(self):
         plugin = pathlib.Path(__file__).resolve().parents[1]
         root = plugin.parents[1]
         marketplace = json.loads((root / "marketplace.json").read_text())
-        manifest = json.loads((plugin / ".codex-plugin/plugin.json").read_text())
-        self.assertEqual(marketplace["plugins"][0]["name"], manifest["name"])
-        self.assertEqual(marketplace["plugins"][0]["source"]["path"], "./plugins/signaltrace")
+        self.assertNotIn("plugins", marketplace)
+        self.assertEqual(len(marketplace["skills"]), 5)
+        entrypoints = [item for item in marketplace["skills"] if item.get("entrypoint") is True]
+        self.assertEqual([item["id"] for item in entrypoints], ["audit-entrypoint"])
+        self.assertEqual(len({item["id"] for item in marketplace["skills"]}), 5)
+        for item in marketplace["skills"]:
+            self.assertTrue((root / item["path"] / "SKILL.md").is_file(), item["path"])
+
+    def test_all_declared_skills_have_mit_frontmatter(self):
+        plugin = pathlib.Path(__file__).resolve().parents[1]
+        root = plugin.parents[1]
+        marketplace = json.loads((root / "marketplace.json").read_text())
+        for item in marketplace["skills"]:
+            text = (root / item["path"] / "SKILL.md").read_text()
+            self.assertTrue(text.startswith("---\n"), item["id"])
+            frontmatter = text.split("---", 2)[1]
+            self.assertIn(f"name: {item['id']}", frontmatter)
+            self.assertIn("description:", frontmatter)
+            self.assertIn("license: MIT", frontmatter)
+
+
+class InputModeTests(unittest.TestCase):
+    @staticmethod
+    def _script() -> pathlib.Path:
+        return pathlib.Path(__file__).resolve().with_name("signaltrace.py")
+
+    def test_positional_url_does_not_read_open_silent_stdin(self):
+        process = subprocess.Popen(
+            [sys.executable, str(self._script()), "--deadline", "0.5", "file:///unsupported"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(process.wait(timeout=2), 0)
+            report = json.loads(process.stdout.read())
+            self.assertEqual(report["site"], "file:///unsupported")
+        finally:
+            if process.stdin:
+                process.stdin.close()
+            if process.poll() is None:
+                process.kill()
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
+
+    def test_explicit_stdin_envelope(self):
+        process = subprocess.run(
+            [sys.executable, str(self._script()), "--input-stdin", "--deadline", "0.5"],
+            input='{"site":"file:///unsupported","sources":[],"claims":[],"citations":[]}',
+            capture_output=True, text=True, timeout=2, check=False)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        report = json.loads(process.stdout)
+        self.assertEqual(report["site"], "file:///unsupported")
 
 
 if __name__ == "__main__":

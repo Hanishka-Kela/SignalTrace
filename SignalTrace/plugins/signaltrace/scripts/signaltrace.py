@@ -27,6 +27,9 @@ CHECKS = [
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one read-only SignalTrace audit")
     parser.add_argument("site", nargs="?", help="public HTTP(S) target")
+    parser.add_argument(
+        "--input-stdin", action="store_true",
+        help="read one JSON audit envelope from stdin; stdin is otherwise ignored")
     parser.add_argument("--max-requests", type=int, default=DEFAULTS.global_request_maximum)
     parser.add_argument("--target-request-maximum", type=int, default=DEFAULTS.target_request_maximum)
     parser.add_argument("--max-concurrency", type=int, default=DEFAULTS.cross_origin_concurrency)
@@ -45,13 +48,14 @@ def _arguments() -> argparse.Namespace:
 
 def _input(args: argparse.Namespace) -> dict[str, Any]:
     payload: dict[str, Any] = {}
-    if not sys.stdin.isatty():
+    if args.input_stdin:
         raw = sys.stdin.read().strip()
-        if raw:
-            decoded = json.loads(raw)
-            if not isinstance(decoded, dict):
-                raise ValueError("stdin JSON must be an object")
-            payload = decoded
+        if not raw:
+            raise ValueError("--input-stdin requires one JSON object on stdin")
+        decoded = json.loads(raw)
+        if not isinstance(decoded, dict):
+            raise ValueError("stdin JSON must be an object")
+        payload = decoded
     if args.site:
         payload["site"] = args.site
     if not payload.get("site"):

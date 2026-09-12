@@ -1,6 +1,7 @@
 ---
 name: content-engagement-audit
 description: Inspect cached initial HTML for answer availability and usable continuation paths after an AI referral. Use as a bounded SignalTrace specialist; do not infer analytics or runtime failures.
+license: MIT
 ---
 
 # Content engagement audit
