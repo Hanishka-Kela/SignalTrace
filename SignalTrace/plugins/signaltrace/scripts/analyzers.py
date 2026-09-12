@@ -1039,15 +1039,18 @@ def improvement_opportunity_audit(page: PageParser, url: str,
     # ProductGroup level (e.g. Shopify-style pages that group variants under one ProductGroup
     # node). _walk_jsonld already yields the ProductGroup node; the prior omission of
     # "productgroup" from this set was the gap. _walk_jsonld is intentionally NOT widened to
-    # recurse into hasVariant: that would affect every other check that consumes parsed_nodes
-    # (schema-minimum, sameAs, etc.) and is a broader change. Fixing the type filter here is
-    # the minimal, scoped correction.
+    # recurse into hasVariant or similar nested product-bearing properties: that would
+    # yield inner Product nodes to every consumer of parsed_nodes (schema-minimum, sameAs,
+    # etc.) and is a broader change than this detection gap. Special-casing ProductGroup
+    # here is sufficient: AggregateRating/Review on the group node are the review signals
+    # this rule cares about, and either property is enough to suppress (schema.org and the
+    # rule action are OR, not AND).
     product_or_service_nodes = [node for _, node in parsed_nodes
                                 if _types(node).intersection({"product", "productgroup", "service"})]
     for node in product_or_service_nodes:
         missing = [field for field in ("aggregateRating", "review")
                if field not in node or node.get(field) in (None, "")]
-        if missing:
+        if len(missing) == 2:
             items.append(opportunity(
                 rule_id="opportunity-structured-review-signals", priority="low",
                 category="discoverability",

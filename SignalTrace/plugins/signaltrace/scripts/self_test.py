@@ -167,7 +167,6 @@ class AnalyzerTests(unittest.TestCase):
         self.assertNotIn("opportunity-structured-review-signals", ids)
 
 
-
     def test_visible_questions_without_faq_schema_get_proactive_opportunity(self):
         page = parse_page("<h2>What is Widget?</h2><p>Widget is useful.</p>"
                           "<h2>Where is Widget used?</h2><p>At home.</p>",
