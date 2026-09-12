@@ -13,7 +13,8 @@ import time
 import unittest
 
 from analyzers import (
-    bot_directives_audit, content_engagement_audit, deduplicate_findings, destination_observation,
+    bot_directives_audit, content_engagement_audit, deduplicate_findings,
+    deduplicate_opportunities, destination_observation, improvement_opportunity_audit,
     parse_page, source_verification, structured_data_audit,
 )
 from runtime import Evidence, RequestGovernor
@@ -107,6 +108,62 @@ class AnalyzerTests(unittest.TestCase):
         self.assertTrue(any("duplicates" in item for item in unresolved))
 
 
+class ImprovementOpportunityTests(unittest.TestCase):
+    def test_missing_structured_data_is_opportunity_not_finding(self):
+        page = parse_page("<html><head><title>About</title></head><body><h1>About</h1><p>Useful answer.</p></body></html>",
+                          "https://example.com/")
+        findings, _ = structured_data_audit(page, "https://example.com/")
+        opportunities = improvement_opportunity_audit(page, "https://example.com/")
+        self.assertEqual(findings, [])
+        item = next(value for value in opportunities if value["id"] == "opportunity-structured-data")
+        self.assertIs(item["is_finding"], False)
+        self.assertEqual(item["evidence"]["source"], "initial HTML")
+
+    def test_jsonld_suppresses_missing_structured_data_opportunity(self):
+        page = parse_page(
+            '<script type="application/ld+json">{"@type":"Organization","name":"Example"}</script><h1>Example</h1>',
+            "https://example.com/")
+        ids = {item["id"] for item in improvement_opportunity_audit(page, "https://example.com/")}
+        self.assertNotIn("opportunity-structured-data", ids)
+
+    def test_image_fact_requires_an_observed_image(self):
+        without_image = parse_page("<p>Overview</p>", "https://example.com/")
+        with_image = parse_page('<img src="facts.png" alt="Calories 200"><p>Overview</p>',
+                                "https://example.com/")
+        absent_ids = {item["id"] for item in improvement_opportunity_audit(without_image, "https://example.com/")}
+        present = improvement_opportunity_audit(with_image, "https://example.com/")
+        present_ids = {item["id"] for item in present}
+        self.assertNotIn("opportunity-media-text-equivalent", absent_ids)
+        self.assertIn("opportunity-media-text-equivalent", present_ids)
+        item = next(value for value in present if value["id"] == "opportunity-media-text-equivalent")
+        self.assertIn("Calories 200", item["evidence"]["observed"])
+
+    def test_visible_waitlist_suppresses_recovery_opportunity(self):
+        page = parse_page("<h1>Workshop</h1><p>Currently unavailable. Join the waitlist.</p>",
+                          "https://example.com/workshop")
+        ids = {item["id"] for item in improvement_opportunity_audit(page, page.base_url)}
+        self.assertNotIn("opportunity-recovery-path", ids)
+
+    def test_unavailable_without_recovery_gets_opportunity(self):
+        page = parse_page("<h1>Workshop</h1><p>Currently unavailable.</p>",
+                          "https://example.com/workshop")
+        opportunities = improvement_opportunity_audit(page, page.base_url)
+        item = next(value for value in opportunities if value["id"] == "opportunity-recovery-path")
+        self.assertEqual(item["priority"], "high")
+        self.assertEqual(item["evidence"]["observed"].casefold(), "currently unavailable")
+
+    def test_opportunity_contract_and_deduplication(self):
+        page = parse_page("<p>Plain answer.</p>", "https://example.com/")
+        item = improvement_opportunity_audit(page, page.base_url)[0]
+        self.assertEqual(set(item), {
+            "id", "priority", "category", "action", "reason", "evidence",
+            "confidence", "is_finding"})
+        self.assertEqual(set(item["evidence"]), {"url", "source", "observed"})
+        self.assertTrue(item["evidence"]["observed"])
+        self.assertIs(item["is_finding"], False)
+        self.assertEqual(deduplicate_opportunities([item, dict(item)]), [item])
+
+
 class RuntimeTests(unittest.TestCase):
     def test_robots_denial_prevents_page_request(self):
         governor = RequestGovernor(max_requests=3, max_concurrency=1, timeout=1,
@@ -169,12 +226,12 @@ class RuntimeTests(unittest.TestCase):
 
 
 class PackageTests(unittest.TestCase):
-    def test_contest_manifest_has_five_skills_one_entrypoint_and_valid_paths(self):
+    def test_contest_manifest_has_six_skills_one_entrypoint_and_valid_paths(self):
         plugin = pathlib.Path(__file__).resolve().parents[1]
         root = plugin.parents[1]
         marketplace = json.loads((root / "marketplace.json").read_text())
         self.assertNotIn("plugins", marketplace)
-        self.assertEqual(len(marketplace["skills"]), 5)
+        self.assertEqual(len(marketplace["skills"]), 6)
         entrypoints = [item for item in marketplace["skills"] if item.get("entrypoint") is True]
         self.assertEqual([item["id"] for item in entrypoints], ["audit-entrypoint"])
         self.assertEqual(len({item["id"] for item in marketplace["skills"]}), 5)
