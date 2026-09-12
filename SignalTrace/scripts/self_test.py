@@ -250,6 +250,65 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(malformed["evidence"]["block"], 2)
         self.assertIn("line", malformed["evidence"])
 
+    def test_structured_evidence_has_bounded_excerpt_and_block_location(self):
+        payload = "{" + '"@type":"Organization","description":"' + ("x" * 700) + '"}'
+        page = parse_page(
+            "<script type='application/ld+json'>" + payload + "</script>",
+            "https://example.com/")
+        findings, _ = structured_data_audit(page, page.base_url)
+        evidence = next(item["evidence"] for item in findings
+                        if item["_code"] == "schema-minimum-organization")
+        self.assertLessEqual(len(evidence["excerpt"]), 500)
+        self.assertEqual(evidence["location"], {"jsonld_script_block": 1})
+
+    def test_finding_evidence_redacts_secrets_and_has_deterministic_provenance(self):
+        long_excerpt = "word " * 200
+        item = finding(
+            code="fixture", title="Fixture", severity="Medium", confidence=1,
+            evidence={"text_excerpt": long_excerpt, "Authorization": "Bearer secret-token",
+                      "observed": "A directly observed condition."},
+            affected_url="https://example.com/", evidence_type="initial HTML",
+            responsible_party="site-published content", impact="Observed.",
+            suggested_action="Review.", priority=1)
+        evidence = item["evidence"]
+        self.assertLessEqual(len(evidence["excerpt"]), 500)
+        self.assertEqual(evidence["url"], "https://example.com/")
+        self.assertEqual(evidence["source_representation"], "initial HTML")
+        self.assertEqual(evidence["observed_condition"], "A directly observed condition.")
+        self.assertEqual(evidence["location"], {"reference": "affected URL"})
+        serialized = json.dumps(evidence).casefold()
+        self.assertNotIn("authorization", serialized)
+        self.assertNotIn("secret-token", serialized)
+
+    def test_missing_opportunity_does_not_receive_fabricated_excerpt(self):
+        page = parse_page(
+            "<title>Welcome</title><h1>Welcome</h1><p>Currently unavailable.</p>",
+            "https://example.com/product")
+        _, opportunities, _ = visitor_journey_audit(page, page.base_url, [])
+        missing = next(item for item in opportunities
+                       if item["id"] == "opportunity-value-proposition")
+        self.assertIsInstance(missing["evidence"]["observed"], str)
+        self.assertNotIn("excerpt", missing["evidence"]["observed"])
+
+    def test_control_and_link_locations_are_stable_and_bounded(self):
+        page = parse_page(
+            "<nav><a href='/missing'>Useful destination</a></nav>"
+            "<h1>Tools</h1><button id='empty'></button>",
+            "https://example.com/")
+        _, opportunities, _ = visitor_journey_audit(page, page.base_url, [])
+        control = next(item for item in opportunities
+                       if item["id"].startswith("opportunity-control-labels"))
+        observed = control["evidence"]["observed"][0]
+        self.assertLessEqual(len(observed["excerpt"]), 500)
+        self.assertEqual(observed["location"]["control_index"], 1)
+        self.assertEqual(observed["location"]["html_character_offset"],
+                         page.raw_html.find("<button"))
+        link = {"url": "https://example.net/missing", "text": "Useful destination",
+                "link_index": 1}
+        evidence = Evidence(link["url"], link["url"], 404, {}, b"", [], "http-error")
+        findings, _ = destination_observation(link, page.base_url, evidence, None)
+        self.assertEqual(findings[0]["evidence"]["location"], {"link_index": 1})
+
     def test_graph_wrapped_organization_name_satisfies_schema_minimum(self):
         page = parse_page(
             '<script type="application/ld+json">{"@graph":[{"@type":"Organization",'

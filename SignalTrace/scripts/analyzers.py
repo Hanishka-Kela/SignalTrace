@@ -19,9 +19,32 @@ def compact(value: str, limit: int = 280) -> str:
     return value if len(value) <= limit else value[:limit - 1] + "…"
 
 
+def _bounded_html_excerpt(raw: str, offset: int, length: int = 500) -> str:
+    """Return a whitespace-normalized, bounded excerpt around an HTML offset."""
+    if offset < 0 or not raw:
+        return ""
+    start = max(0, offset - 120)
+    end = min(len(raw), offset + max(80, length - 120))
+    excerpt = compact(raw[start:end], 500)
+    excerpt = re.sub(r"(?i)\bBearer\s+[^\s<>'\"]+", "Bearer [redacted]", excerpt)
+    excerpt = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "[redacted-email]", excerpt)
+    return excerpt
+
+
+def _html_provenance(page: "PageParser", needle: str) -> dict[str, Any]:
+    """Locate observed text in the original payload without executing it."""
+    raw = getattr(page, "raw_html", "")
+    offset = raw.casefold().find(str(needle or "").casefold()) if needle else -1
+    result: dict[str, Any] = {}
+    if offset >= 0:
+        result["excerpt"] = _bounded_html_excerpt(raw, offset)
+        result["location"] = {"html_character_offset": offset}
+    return result
+
+
 _TRACKING_PARAMETER_NAMES = {
     "gclid", "gad_source", "gad_campaignid", "gbraid", "clickid", "fbclid",
-    "dclid", "msclkid", "twclid", "mc_cid", "mc_eid", "srsltid", "campaign_id",
+    "wbraid", "ttclid", "li_fat_id", "dclid", "msclkid", "twclid", "mc_cid", "mc_eid", "srsltid", "campaign_id",
     "deep_link_value", "is_retargeting", "pid", "c", "host_internal",
     "product_name", "storecontext",
 }
@@ -60,10 +83,72 @@ def _canonicalize_url_fields(value: Any) -> Any:
     return value
 
 
+_SENSITIVE_EVIDENCE_KEYS = re.compile(
+    r"(?:authorization|cookie|set-cookie|password|passwd|secret|token|api[-_]?key|session)", re.I)
+
+
+def _redact_sensitive_evidence(value: Any) -> Any:
+    """Drop credential-bearing fields before evidence enters a report."""
+    if isinstance(value, dict):
+        return {key: _redact_sensitive_evidence(item)
+                for key, item in value.items() if not _SENSITIVE_EVIDENCE_KEYS.search(str(key))}
+    if isinstance(value, list):
+        return [_redact_sensitive_evidence(item) for item in value]
+    if isinstance(value, str):
+        value = re.sub(r"(?i)\bBearer\s+[^\s<>'\"]+", "Bearer [redacted]", value)
+        value = re.sub(r"(?i)\b(?:api[_-]?key|token|secret|password|passwd)\s*[=:]\s*[^\s<>'\"]+",
+                       "[redacted-sensitive-value]", value)
+        value = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "[redacted-email]", value)
+    return value
+
+
+def _finding_evidence_metadata(evidence: Any, affected_url: str,
+                               evidence_type: str) -> Any:
+    """Attach bounded provenance to each top-level finding evidence object."""
+    blocks = evidence if isinstance(evidence, list) else [evidence]
+    enriched = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            enriched.append(block)
+            continue
+        item = dict(block)
+        item.setdefault("url", affected_url)
+        item.setdefault("source_representation", evidence_type)
+        if "excerpt" in item and isinstance(item["excerpt"], str):
+            item["excerpt"] = compact(item["excerpt"], 500)
+        elif "text_excerpt" in item and isinstance(item["text_excerpt"], str):
+            item["excerpt"] = compact(item["text_excerpt"], 500)
+        if "observed_condition" not in item:
+            for key in ("observed", "state", "missing", "message", "status", "outcome"):
+                if item.get(key) not in (None, "", [], {}):
+                    item["observed_condition"] = item[key]
+                    break
+        if "observed_condition" not in item:
+            item["observed_condition"] = compact(json.dumps(block, sort_keys=True), 500)
+        if "location" not in item:
+            if "block" in item:
+                item["location"] = {"jsonld_script_block": item["block"]}
+            elif "link_index" in item:
+                item["location"] = {"link_index": item["link_index"]}
+            elif "attribute" in item:
+                item["location"] = {"attribute": item["attribute"]}
+            elif "checks" in item:
+                item["location"] = {"checks": item["checks"]}
+            elif "html_character_offset" in item:
+                item["location"] = {"html_character_offset": item["html_character_offset"]}
+            else:
+                item["location"] = {"reference": "affected URL"}
+        enriched.append(item)
+    return enriched if isinstance(evidence, list) else enriched[0]
+
+
 _VOLATILE_FINDING_EVIDENCE_FIELDS = {
     # Inline script length can change on unchanged pages due to server-side
     # nonces or timestamps; it is diagnostic context, not defect identity.
     "script_characters",
+    # Derived provenance repeats the diagnostic fields above; keep identity
+    # based on the underlying observed evidence instead.
+    "observed_condition",
 }
 
 
@@ -102,7 +187,8 @@ def finding(*, code: str, title: str, severity: str, confidence: float,
             responsible_party: str, impact: str, suggested_action: str,
             priority: int, coverage_status: str = "confirmed") -> dict[str, Any]:
     affected_url = canonicalize_url(affected_url)
-    evidence = _canonicalize_url_fields(evidence)
+    evidence = _finding_evidence_metadata(
+        _redact_sensitive_evidence(_canonicalize_url_fields(evidence)), affected_url, evidence_type)
     severity = severity.casefold()
     if severity not in {"critical", "high", "medium"}:
         raise ValueError(f"unsupported finding severity: {severity}")
@@ -160,6 +246,7 @@ class PageParser(HTMLParser):
     def __init__(self, base_url: str):
         super().__init__(convert_charrefs=True)
         self.base_url = base_url
+        self.raw_html = ""
         self.title = ""
         self.meta: dict[str, str] = {}
         self.links: list[dict[str, str]] = []
@@ -281,6 +368,7 @@ class PageParser(HTMLParser):
             link = {
                 "url": urllib.parse.urljoin(self.base_url, attrs["href"]),
                 "text": text or attrs.get("title", ""),
+                "link_index": len(self.links) + 1,
                 "title": attrs.get("title", ""),
                 "rel": attrs.get("rel", ""),
                 "section": section,
@@ -314,6 +402,7 @@ class PageParser(HTMLParser):
             ), "")
             control = {
                 "tag": tag,
+                "control_index": len(self.controls) + 1,
                 "id": attrs.get("id", ""),
                 "type": attrs.get("type", ""),
                 "name": attrs.get("name", ""),
@@ -359,8 +448,20 @@ class PageParser(HTMLParser):
 
 def parse_page(html: str, url: str) -> PageParser:
     parser = PageParser(url)
+    parser.raw_html = html
     parser.feed(html)
     parser.close()
+    # HTMLParser exposes parsed semantics but not source offsets. Locate each
+    # element deterministically in the original payload for bounded provenance.
+    cursor = 0
+    for control in parser.controls:
+        tag = re.escape(str(control.get("tag") or ""))
+        match = re.search(rf"<{tag}\b[^>]*>", html[cursor:], re.I)
+        if match:
+            offset = cursor + match.start()
+            control["html_character_offset"] = offset
+            control["html_excerpt"] = _bounded_html_excerpt(html, offset)
+            cursor = cursor + match.end()
     for control in parser.controls:
         if control.get("id") in parser.labels:
             control["associated_label"] = parser.labels[control["id"]]
@@ -454,21 +555,31 @@ def structured_data_audit(page: PageParser, url: str) -> tuple[list[dict], list[
             if one_of and not any(node.get(prop) for prop in one_of):
                 missing.append("one of: " + ", ".join(one_of))
             if missing:
+                block_excerpt = compact(page.jsonld[block - 1], 500) if block <= len(page.jsonld) else ""
+                evidence = {"block": block, "type": node.get("@type"), "missing": missing,
+                            "id": node.get("@id")}
+                if block_excerpt:
+                    evidence["excerpt"] = block_excerpt
+                    evidence["location"] = {"jsonld_script_block": block}
                 findings.append(finding(
                     code=f"schema-minimum-{node_type}",
                     title=f"{node_type} node lacks feature-minimum evidence",
                     severity="Medium", confidence=.91,
-                    evidence={"block": block, "type": node.get("@type"), "missing": missing,
-                              "id": node.get("@id")}, affected_url=url,
+                    evidence=evidence, affected_url=url,
                     evidence_type="initial-html/json-ld", responsible_party="site-published link",
                     impact="The declared entity is incomplete for its represented feature.",
                     suggested_action=f"Add the supported {', '.join(missing)} evidence to this {node_type} node, or remove the unsupported type.",
                     priority=55))
         if "offer" in _types(node) and node.get("price") not in (None, "") and not node.get("priceCurrency"):
+            block_excerpt = compact(page.jsonld[block - 1], 500) if block <= len(page.jsonld) else ""
+            evidence = {"block": block, "type": node.get("@type"),
+                        "price": node.get("price"), "missing": "priceCurrency"}
+            if block_excerpt:
+                evidence["excerpt"] = block_excerpt
+                evidence["location"] = {"jsonld_script_block": block}
             findings.append(finding(
                 code="offer-currency", title="Offer price has no currency scope", severity="Medium",
-                confidence=.96, evidence={"block": block, "type": node.get("@type"),
-                                          "price": node.get("price"), "missing": "priceCurrency"},
+                confidence=.96, evidence=evidence,
                 affected_url=url, evidence_type="initial-html/json-ld",
                 responsible_party="site-published link",
                 impact="The numerical price cannot be interpreted at the required currency scope.",
@@ -484,11 +595,12 @@ def content_engagement_audit(page: PageParser, url: str) -> tuple[list[dict], li
     word_count = len(re.findall(r"\b\w+\b", text))
     meaningful_links = [item for item in page.links if item["text"].strip()]
     if word_count < 25 and page.script_chars > max(1500, len(text) * 8):
+        provenance = _html_provenance(page, text.split()[0] if text.split() else "")
         findings.append(finding(
             code="initial-html-answer-empty", title="Initial HTML contains no substantial answer-bearing text",
             severity="Medium", confidence=.9,
             evidence={"readable_word_count": word_count, "script_characters": page.script_chars,
-                      "title": page.title, "text_excerpt": compact(text)}, affected_url=url,
+                      "title": page.title, "text_excerpt": compact(text), **provenance}, affected_url=url,
             evidence_type="initial-html", responsible_party="site-published link",
             impact="A text-only consumer receives an app shell or very thin representation instead of a supported answer.",
             suggested_action="Include the page's primary answer and entity identity in the initial HTML while retaining progressive enhancement.",
@@ -497,10 +609,11 @@ def content_engagement_audit(page: PageParser, url: str) -> tuple[list[dict], li
                    if not _is_tracking_image(img)
                    and not img.get("alt") and (img.get("src") or img.get("title"))]
     if word_count < 40 and image_facts and not page.headings:
+        provenance = _html_provenance(page, image_facts[0].get("src", ""))
         findings.append(finding(
             code="image-only-evidence", title="Primary representation appears image-dependent without text alternatives",
             severity="Medium", confidence=.76,
-            evidence={"readable_word_count": word_count, "images_without_alt": image_facts[:3]},
+            evidence={"readable_word_count": word_count, "images_without_alt": image_facts[:3], **provenance},
             affected_url=url, evidence_type="initial-html/accessibility",
             responsible_party="site-published link",
             impact="Important identity or task evidence may be unavailable to non-visual consumers.",
@@ -512,11 +625,12 @@ def content_engagement_audit(page: PageParser, url: str) -> tuple[list[dict], li
         r"\b(notify|waitlist|similar|alternative|other (?:product|option)|contact|back|category|shop|browse)\b",
         item.get("text", ""), re.I) for item in meaningful_links)
     if commerce_words and not continuation and not useful_route:
+        provenance = _html_provenance(page, commerce_words.group(0))
         findings.append(finding(
             code="oos-no-route", title="Out-of-stock state has no observed continuation route",
             severity="Medium", confidence=.88,
             evidence={"state": commerce_words.group(0), "useful_recovery_route": False,
-                      "text_excerpt": compact(text)}, affected_url=url,
+                      "text_excerpt": compact(text), **provenance}, affected_url=url,
             evidence_type="initial-html/visible-text", responsible_party="site-published link",
             impact="A referred visitor reaches a known unavailable state with no usable next action in the fetched representation.",
             suggested_action="Expose a relevant alternative, variant selector, or existing notification path as a normal link or accessible control.",
@@ -621,14 +735,23 @@ def product_service_evidence(page: PageParser, url: str) -> list[dict[str, Any]]
         if not value or key in seen:
             return
         seen.add(key)
-        facts.append({
+        fact = {
             "url": url,
             "field": field,
             "source_location": location,
             "exact_observed_text": raw,
             "normalized_value": value,
             "confidence": confidence,
-        })
+        }
+        block_match = re.search(r"JSON-LD block (\d+)", location)
+        if block_match:
+            block = int(block_match.group(1))
+            if block <= len(page.jsonld):
+                fact["excerpt"] = compact(page.jsonld[block - 1], 500)
+                fact["location"] = {"jsonld_script_block": block}
+        else:
+            fact.update(_html_provenance(page, raw))
+        facts.append(fact)
 
     if page.title:
         add("page_title", "title", page.title)
@@ -1450,17 +1573,24 @@ def _unlabelled_control_evidence(control: dict[str, Any]) -> dict[str, Any]:
 
 def _group_unlabelled_control_evidence(controls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Retain each distinct control signature and count indistinguishable repeats."""
-    grouped: dict[str, tuple[dict[str, Any], int]] = {}
+    grouped: dict[str, tuple[dict[str, Any], int, dict[str, Any]]] = {}
     for control in controls:
         evidence = _unlabelled_control_evidence(control)
         key = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
-        prior, count = grouped.get(key, (evidence, 0))
-        grouped[key] = (prior, count + 1)
+        prior, count, representative = grouped.get(key, (evidence, 0, control))
+        grouped[key] = (prior, count + 1, representative)
     result = []
     for key in sorted(grouped):
-        evidence, count = grouped[key]
+        evidence, count, representative = grouped[key]
         if count > 1:
             evidence["occurrence_count"] = count
+        if representative.get("html_excerpt"):
+            evidence["excerpt"] = representative["html_excerpt"]
+        if representative.get("html_character_offset") is not None:
+            evidence["location"] = {
+                "html_character_offset": representative["html_character_offset"],
+                "control_index": representative.get("control_index"),
+            }
         result.append(evidence)
     return result
 
@@ -1545,12 +1675,20 @@ def visitor_journey_audit(target_page: PageParser, target_url: str,
                        if len(urls) > 1 or label in {"more", "learn", "explore", "click here", "item"})
     empty_nav = sum(not link.get("text", "").strip() for link in nav_links)
     if ambiguous or empty_nav:
+        nav_evidence = [{
+            "link_index": link.get("link_index"),
+            "text": link.get("text", ""),
+            "href": link.get("url", ""),
+        } for link in nav_links if not link.get("text", "").strip()
+           or link.get("text", "").strip().casefold() in ambiguous]
         opportunities.append(opportunity(
             rule_id="opportunity-navigation-labels", priority="medium", category="navigation",
             action="Use unique, descriptive labels for primary navigation destinations.",
             reason="The fetched navigation contains ambiguous, repeated, or empty link labels.",
             url=target_url, source="initial HTML",
-            observed=json.dumps({"ambiguous_labels": ambiguous[:8], "empty_labels": empty_nav}, sort_keys=True),
+            observed={"condition": "Ambiguous, repeated, or empty navigation labels were observed.",
+                      "ambiguous_labels": ambiguous[:8], "empty_labels": empty_nav,
+                      "links": nav_evidence[:12]},
             confidence="certain"))
 
     internal = [link for link in target_page.links
@@ -1911,7 +2049,8 @@ def same_as_destination_observation(declaration: dict[str, Any], source_url: str
             severity="High", confidence=.98,
             evidence={"brand": brand, "declared_url": declared_url,
                       "final_url": evidence.final_url, "observed": compact(parked.group(0)),
-                      "redirect_chain": evidence.redirect_chain}, affected_url=source_url,
+                      "redirect_chain": evidence.redirect_chain,
+                      **_html_provenance(destination_page, parked.group(0))}, affected_url=source_url,
             evidence_type="json-ld/sameAs/destination-visible-text",
             responsible_party="site-published link",
             impact="The published identity claim resolves to a destination that presents itself as parked or for sale.",
@@ -1962,7 +2101,8 @@ def same_as_destination_observation(declaration: dict[str, Any], source_url: str
             evidence={"brand": brand, "declared_url": declared_url,
                       "final_url": evidence.final_url, "destination_identity": positive[:5],
                       "scope_comparisons": exact_results,
-                      "redirect_chain": evidence.redirect_chain}, affected_url=source_url,
+                      "redirect_chain": evidence.redirect_chain,
+                      **_html_provenance(destination_page, positive[0]["value"])}, affected_url=source_url,
             evidence_type="json-ld/sameAs/destination-identity",
             responsible_party="site-published link",
             impact="The site's machine-readable identity claim points to a page that states a different entity name.",
@@ -1989,6 +2129,7 @@ def destination_observation(link: dict[str, str], source_url: str, evidence,
             code="destination-broken", title="Published link has an unresolved destination",
             severity="High", confidence=.98,
             evidence={"link_text": context, "authored_url": link["url"],
+                      "link_index": link.get("link_index"), "href": link["url"],
                       "redirect_chain": evidence.redirect_chain, "status": evidence.status,
                       "outcome": evidence.outcome, "detail": evidence.detail}, affected_url=source_url,
             evidence_type="http-destination-chain", responsible_party=responsibility,
@@ -2010,6 +2151,7 @@ def destination_observation(link: dict[str, str], source_url: str, evidence,
             code="specific-citation-homepage", title="Specific published citation resolves to a homepage",
             severity="High", confidence=.94 if specific_context else .86,
             evidence={"link_text": context, "authored_url": link["url"],
+                      "link_index": link.get("link_index"), "href": link["url"],
                       "redirect_chain": evidence.redirect_chain, "final_url": evidence.final_url,
                       "destination_title": destination_page.title}, affected_url=source_url,
             evidence_type="claim-link-destination", responsible_party=responsibility,
@@ -2022,6 +2164,7 @@ def destination_observation(link: dict[str, str], source_url: str, evidence,
             code="destination-empty", title="Published link resolves to an effectively empty HTML page",
             severity="Medium", confidence=.95,
             evidence={"link_text": context, "authored_url": link["url"],
+                      "link_index": link.get("link_index"), "href": link["url"],
                       "final_url": evidence.final_url, "readable_word_count": words,
                       "redirect_chain": evidence.redirect_chain}, affected_url=source_url,
             evidence_type="http-destination-chain/initial-html",

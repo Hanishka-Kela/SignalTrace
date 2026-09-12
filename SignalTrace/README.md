@@ -1,57 +1,45 @@
 # SignalTrace
 
-Read-only, evidence-backed auditor for AI discoverability and on-site
-engagement problems. Given a public URL, it fetches the page and a bounded,
-robots-aware sample of internal links (via `curl` only — no browser
-rendering, no third-party packages) and emits one JSON report of confirmed
-findings plus suggested, non-destructive improvements. It never modifies the
-target site.
+SignalTrace is a read-only website audit marketplace for diagnosing AI discoverability
+and visitor-engagement problems from bounded public web evidence.
+
+It respects `robots.txt`, uses curl-only HTTP requests, applies shared request limits,
+and never modifies the audited website.
 
 ## Skills
 
-- **`audit-entrypoint`** *(entrypoint)* — Runs the audit end-to-end: fetches
-  the target, selects a small deterministic sample of internal links, and is
-  the only skill allowed to make network requests. It calls each specialist
-  below against the cached evidence and assembles their output into one
-  report.
+- **audit-entrypoint** — Coordinates the complete audit and emits one JSON report.
+- **structured-data-audit** — Checks JSON-LD, Microdata, RDFa, entity identity, and
+  structured-data consistency.
+- **content-engagement-audit** — Checks readable content, navigation, controls,
+  continuation paths, product facts, and static engagement risks.
+- **citation-destination-audit** — Verifies supplied citation and `sameAs` destinations,
+  redirects, identity matches, dead links, and parked pages.
+- **source-verification-audit** — Compares explicitly supplied claims with fetched
+  independent sources while preserving scope and qualifiers.
+- **improvement-opportunity-audit** — Suggests evidence-grounded improvements for
+  positioning, headings, audience/use-case clarity, search language, and engagement.
+  Suggestions are not treated as confirmed defects.
 
-- **`structured-data-audit`** — Checks JSON-LD, Microdata, and RDFa for
-  validity, required fields, and consistent entity identity.
+## Composition
 
-- **`content-engagement-audit`** — Checks whether a page's initial HTML
-  actually answers the visitor's likely question, has readable text
-  equivalents for image-only content, and offers a usable next step.
+The evaluator invokes `audit-entrypoint`. It:
 
-- **`citation-destination-audit`** — Follows a claim → link → redirect →
-  destination chain and checks whether the page you land on actually
-  supports what was claimed about it.
+1. Parses the supplied URL or JSON input.
+2. Fetches and evaluates `robots.txt`.
+3. Fetches the target page using the shared request governor.
+4. Selects a small, deterministic set of same-origin journey links.
+5. Runs the specialist analyses over cached evidence.
+6. Composes one report containing `findings` and `suggested_actions`.
+7. Emits the report as JSON on standard output.
 
-- **`source-verification-audit`** — Compares supplied claims against
-  explicitly provided external sources. Only runs when the caller supplies a
-  `claims`/`sources` input; otherwise it stays dormant and reports as much.
+The audit intentionally analyzes the raw HTML payload returned by the server. This is
+the baseline representation available to lightweight crawlers and AI retrieval systems.
+It does not execute JavaScript, launch a browser, or claim to reproduce a fully rendered
+browser experience. It also does not use analytics, scrape social feeds, or modify a
+live website.
 
-- **`improvement-opportunity-audit`** — Turns the other specialists' cached
-  evidence into non-destructive suggestions (e.g. missing FAQ schema, an
-  Organization node without `sameAs`, a Product without review signals).
-  These are opportunities, never findings — they're not treated as proof of
-  a defect.
-
-## How the entrypoint composes them
-
-`audit-entrypoint` fetches and caches the target page once, then hands that
-same cached evidence to each specialist skill in turn. Every specialist
-reads only from that shared cache — none of them fetch anything on their
-own. `audit-entrypoint` collects each specialist's confirmed findings and
-suggested opportunities, deduplicates and assigns stable IDs, and emits a
-single JSON report with severity, evidence, and a `suggested_action` for
-each item.
-
-## Run it
+## Run
 
 ```bash
-python3 scripts/signaltrace.py <url>
-```
-
-See `references/audit-contract.md` for the full input/output contract,
-including the optional stdin envelope for supplying external
-`claims`/`sources`.
+python3 scripts/signaltrace.py https://example.com
