@@ -6,14 +6,16 @@ from __future__ import annotations
 import json
 import pathlib
 import concurrent.futures
+import inspect
 import time
 import unittest
 
 from analyzers import (
-    content_engagement_audit, deduplicate_findings, destination_observation,
+    bot_directives_audit, content_engagement_audit, deduplicate_findings, destination_observation,
     parse_page, source_verification, structured_data_audit,
 )
 from runtime import Evidence, RequestGovernor
+from config import DEFAULTS, USER_AGENT
 from scope import compare_scopes, normalize_scope
 
 
@@ -38,6 +40,13 @@ class ScopeTests(unittest.TestCase):
 
 
 class AnalyzerTests(unittest.TestCase):
+    def test_conflicting_bot_directives_are_localized(self):
+        page = parse_page("<meta name='robots' content='index, noindex'><p>Answer</p>",
+                          "https://example.com")
+        findings, _ = bot_directives_audit(
+            page, {}, "https://example.com", {"result": "allowed", "detail": "parsed"})
+        self.assertEqual(findings[0]["severity"], "Medium")
+
     def test_jsonld_arrays_graphs_and_exact_malformed_location(self):
         html = """<html><head>
         <script type='application/ld+json'>{"@graph":[{"@type":"Offer","price":"9.00"}]}</script>
@@ -99,32 +108,62 @@ class AnalyzerTests(unittest.TestCase):
 class RuntimeTests(unittest.TestCase):
     def test_robots_denial_prevents_page_request(self):
         governor = RequestGovernor(max_requests=3, max_concurrency=1, timeout=1,
-                                   max_body_bytes=1000, deadline_seconds=3, max_per_origin=3)
+                                   max_body_bytes=1000, deadline_seconds=3, max_per_origin=3,
+                                   spacing_seconds=0)
         calls = []
-        def fake_request(url, body_limit=None):
+        def fake_request(url, *, kind, body_limit):
             calls.append(url)
             return Evidence(url, url, 200, {"content-type": "text/plain"},
                             b"User-agent: *\nDisallow: /private\n", [], "ok")
-        governor._request_once = fake_request  # type: ignore[method-assign]
+        governor._request_with_retries = fake_request  # type: ignore[method-assign]
         result = governor.fetch("https://example.com/private")
         self.assertEqual(result.outcome, "robots-denied")
         self.assertEqual(calls, ["https://example.com/robots.txt"])
 
     def test_concurrent_same_origin_fetches_share_one_robots_request(self):
         governor = RequestGovernor(max_requests=5, max_concurrency=2, timeout=1,
-                                   max_body_bytes=1000, deadline_seconds=3, max_per_origin=5)
+                                   max_body_bytes=1000, deadline_seconds=3, max_per_origin=5,
+                                   spacing_seconds=0)
         calls = []
-        def fake_request(url, body_limit=None):
+        def fake_request(url, *, kind, body_limit):
             calls.append(url)
             if url.endswith("/robots.txt"):
                 time.sleep(.02)
                 return Evidence(url, url, 200, {"content-type": "text/plain"},
                                 b"User-agent: *\nAllow: /\n", [], "ok")
             return Evidence(url, url, 200, {"content-type": "text/html"}, b"<p>ok</p>", [], "ok")
-        governor._request_once = fake_request  # type: ignore[method-assign]
+        governor._request_with_retries = fake_request  # type: ignore[method-assign]
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             list(pool.map(governor.fetch, ["https://example.com/a", "https://example.com/b"]))
         self.assertEqual(calls.count("https://example.com/robots.txt"), 1)
+
+    def test_benchmark_defaults_and_delegation_zero_request_default(self):
+        self.assertEqual(DEFAULTS.global_request_maximum, 20)
+        self.assertEqual(DEFAULTS.target_request_maximum, 16)
+        self.assertEqual(DEFAULTS.per_origin_maximum, 8)
+        self.assertEqual(DEFAULTS.cross_origin_concurrency, 2)
+        self.assertEqual(DEFAULTS.same_origin_concurrency, 1)
+        self.assertEqual(DEFAULTS.request_timeout_seconds, 8)
+        self.assertEqual(DEFAULTS.connection_timeout_seconds, 3)
+        self.assertEqual(DEFAULTS.response_body_limit_bytes, 2 * 1024 * 1024)
+        self.assertEqual(DEFAULTS.aggregate_body_limit_bytes, 12 * 1024 * 1024)
+        self.assertEqual(DEFAULTS.same_origin_spacing_seconds, 2)
+        self.assertEqual(DEFAULTS.retries, 0)
+        governor = RequestGovernor(spacing_seconds=0)
+        context = governor.delegation_context("task-1", "https://example.com/a", ["cache:1"])
+        self.assertEqual(context["maximum_additional_requests"], 0)
+        self.assertEqual(set(context), {
+            "task_identifier", "cached_evidence_references", "permission_status",
+            "remaining_global_request_budget", "remaining_per_origin_budget",
+            "remaining_time", "maximum_additional_requests", "cancellation_deadline"})
+
+    def test_curl_is_only_http_transport_and_has_required_flags(self):
+        source = inspect.getsource(RequestGovernor._curl_once)
+        self.assertIn("subprocess.run", source)
+        for flag in ("--silent", "--show-error", "--location", "--max-time",
+                     "--connect-timeout", "--user-agent", "--compressed"):
+            self.assertIn(flag, source)
+        self.assertEqual(USER_AGENT, "SignalTrace/1.0")
 
 
 class PackageTests(unittest.TestCase):

@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""Bounded robots-aware HTTP runtime and shared evidence cache."""
+"""Curl-only, bounded, robots-aware HTTP governor and evidence cache."""
 
 from __future__ import annotations
 
 import dataclasses
 import ipaddress
+import os
+import re
+import shutil
 import socket
+import subprocess
+import tempfile
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import urllib.robotparser
 from typing import Any
 
-USER_AGENT = "SignalTrace/1.0 (+read-only-public-audit)"
+from config import DEFAULTS, USER_AGENT
+
 REDIRECTS = {301, 302, 303, 307, 308}
 
 
@@ -24,11 +28,6 @@ class LimitError(RuntimeError):
 
 class UnsafeTarget(ValueError):
     pass
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
 
 
 @dataclasses.dataclass
@@ -41,6 +40,8 @@ class Evidence:
     redirect_chain: list[dict[str, Any]]
     outcome: str
     detail: str = ""
+    curl_exit: int | None = None
+    cache_key: str = ""
 
     def text(self) -> str:
         content_type = self.headers.get("content-type", "")
@@ -54,31 +55,68 @@ class Evidence:
             return self.body.decode("utf-8", errors="replace")
 
 
+@dataclasses.dataclass(frozen=True)
+class RobotsDecision:
+    result: str
+    allowed_to_crawl: bool
+    detail: str
+    parser: urllib.robotparser.RobotFileParser | None = None
+
+
 class RequestGovernor:
-    def __init__(self, *, max_requests: int, max_concurrency: int,
-                 timeout: float, max_body_bytes: int, deadline_seconds: float,
-                 max_per_origin: int = 6):
+    """The only SignalTrace component authorized to execute network requests."""
+
+    def __init__(
+        self, *, max_requests: int = DEFAULTS.global_request_maximum,
+        target_request_maximum: int = DEFAULTS.target_request_maximum,
+        max_concurrency: int = DEFAULTS.cross_origin_concurrency,
+        timeout: float = DEFAULTS.request_timeout_seconds,
+        connect_timeout: float = DEFAULTS.connection_timeout_seconds,
+        max_body_bytes: int = DEFAULTS.response_body_limit_bytes,
+        aggregate_body_bytes: int = DEFAULTS.aggregate_body_limit_bytes,
+        deadline_seconds: float = DEFAULTS.global_deadline_seconds,
+        max_per_origin: int = DEFAULTS.per_origin_maximum,
+        spacing_seconds: float = DEFAULTS.same_origin_spacing_seconds,
+        retries: int = DEFAULTS.retries,
+        max_redirects: int = DEFAULTS.maximum_redirects,
+    ):
         self.started_at = time.monotonic()
         self.deadline = self.started_at + deadline_seconds
         self.max_requests = max_requests
+        self.target_request_maximum = min(max_requests, target_request_maximum)
         self.max_per_origin = min(max_requests, max_per_origin)
         self.timeout = timeout
+        self.connect_timeout = connect_timeout
         self.max_body_bytes = max_body_bytes
+        self.aggregate_body_bytes = aggregate_body_bytes
+        self.spacing_seconds = spacing_seconds
+        self.retries = retries
+        self.max_redirects = max_redirects
         self._lock = threading.RLock()
-        self._semaphore = threading.BoundedSemaphore(max_concurrency)
+        self._cross_origin = threading.BoundedSemaphore(min(2, max_concurrency))
         self._started = 0
         self._completed = 0
         self._skipped = 0
+        self._target_started = 0
+        self._redirects = 0
+        self._retries_started = 0
+        self._aggregate_bytes = 0
+        self._aggregate_reserved = 0
         self._origin_started: dict[str, int] = {}
         self._origin_locks: dict[str, threading.Lock] = {}
+        self._origin_last_start: dict[str, float] = {}
         self._cache: dict[str, Evidence] = {}
-        self._robots: dict[str, tuple[bool, urllib.robotparser.RobotFileParser | None, str]] = {}
+        self._response_cache: dict[str, list[Evidence]] = {}
+        self._robots: dict[str, RobotsDecision] = {}
         self._robots_inflight: dict[str, threading.Event] = {}
         self._inflight: dict[str, threading.Event] = {}
-        self._opener = urllib.request.build_opener(_NoRedirect())
+        self._curl_path = shutil.which("curl")
 
     def remaining_seconds(self) -> float:
         return max(0.0, self.deadline - time.monotonic())
+
+    def elapsed_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self.started_at)
 
     def snapshot(self, url: str | None = None) -> dict[str, Any]:
         with self._lock:
@@ -86,8 +124,14 @@ class RequestGovernor:
                 "requests_started": self._started,
                 "requests_completed": self._completed,
                 "requests_skipped": self._skipped,
+                "target_requests_started": self._target_started,
+                "redirects_observed": self._redirects,
+                "retries_started": self._retries_started,
+                "response_bytes_cached": self._aggregate_bytes,
                 "remaining_requests": max(0, self.max_requests - self._started),
+                "remaining_target_requests": max(0, self.target_request_maximum - self._target_started),
                 "remaining_deadline_seconds": round(self.remaining_seconds(), 3),
+                "elapsed_seconds": round(self.elapsed_seconds(), 3),
             }
             if url:
                 origin = self._origin(self.normalize_url(url))
@@ -95,30 +139,43 @@ class RequestGovernor:
                     0, self.max_per_origin - self._origin_started.get(origin, 0))
             return result
 
+    def delegation_context(self, task_identifier: str, url: str,
+                           cached_refs: list[str], maximum_additional_requests: int = 0) -> dict[str, Any]:
+        normalized = self.normalize_url(url)
+        snapshot = self.snapshot(normalized)
+        decision = self._robots.get(self._origin(normalized))
+        return {
+            "task_identifier": task_identifier,
+            "cached_evidence_references": list(cached_refs),
+            "permission_status": decision.result if decision else "not-checked",
+            "remaining_global_request_budget": snapshot["remaining_requests"],
+            "remaining_per_origin_budget": snapshot["remaining_origin_requests"],
+            "remaining_time": snapshot["remaining_deadline_seconds"],
+            "maximum_additional_requests": min(1, max(0, maximum_additional_requests)),
+            "cancellation_deadline": self.deadline,
+        }
+
     @staticmethod
     def normalize_url(url: str) -> str:
-        raw = str(url).strip()
-        parsed = urllib.parse.urlsplit(raw)
-        scheme = parsed.scheme.lower()
-        if scheme not in {"http", "https"} or not parsed.hostname:
+        parsed = urllib.parse.urlsplit(str(url).strip())
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
             raise UnsafeTarget("only absolute public http(s) URLs are supported")
+        if parsed.username or parsed.password:
+            raise UnsafeTarget("credentials in URLs are not supported")
         try:
             host = parsed.hostname.encode("idna").decode("ascii").lower()
             port = parsed.port
         except (UnicodeError, ValueError) as exc:
             raise UnsafeTarget(f"invalid hostname or port: {exc}") from exc
-        if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        if (parsed.scheme.lower() == "http" and port == 80) or (parsed.scheme.lower() == "https" and port == 443):
             port = None
         netloc = host if port is None else f"{host}:{port}"
-        path = parsed.path or "/"
-        return urllib.parse.urlunsplit((scheme, netloc, path, parsed.query, ""))
+        return urllib.parse.urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "/", parsed.query, ""))
 
     @staticmethod
     def _assert_public(url: str) -> None:
         host = urllib.parse.urlsplit(url).hostname
-        if not host:
-            raise UnsafeTarget("URL has no hostname")
-        if host.casefold() in {"localhost", "localhost.localdomain"}:
+        if not host or host.casefold() in {"localhost", "localhost.localdomain"}:
             raise UnsafeTarget("local network targets are not public")
         try:
             infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
@@ -129,7 +186,12 @@ class RequestGovernor:
             if not address.is_global:
                 raise UnsafeTarget("private, loopback, link-local, or reserved targets are blocked")
 
-    def _reserve(self, url: str) -> float:
+    @staticmethod
+    def _origin(url: str) -> str:
+        parts = urllib.parse.urlsplit(url)
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+
+    def _reserve(self, url: str, kind: str, requested_body_bytes: int) -> tuple[float, int]:
         with self._lock:
             remaining = self.remaining_seconds()
             if remaining <= 0:
@@ -137,157 +199,276 @@ class RequestGovernor:
                 raise LimitError("global deadline exhausted")
             if self._started >= self.max_requests:
                 self._skipped += 1
-                raise LimitError("request budget exhausted")
+                raise LimitError("global request ceiling reached")
             origin = self._origin(url)
             if self._origin_started.get(origin, 0) >= self.max_per_origin:
                 self._skipped += 1
-                raise LimitError("per-origin request budget exhausted")
+                raise LimitError("per-origin request ceiling reached")
+            if kind != "robots" and self._target_started >= self.target_request_maximum:
+                self._skipped += 1
+                raise LimitError("target request ceiling reached")
+            aggregate_remaining = self.aggregate_body_bytes - self._aggregate_bytes - self._aggregate_reserved
+            if aggregate_remaining <= 0:
+                self._skipped += 1
+                raise LimitError("aggregate response body ceiling reached")
             self._started += 1
             self._origin_started[origin] = self._origin_started.get(origin, 0) + 1
-            return min(self.timeout, remaining)
+            if kind != "robots":
+                self._target_started += 1
+            if kind == "retry":
+                self._retries_started += 1
+            reserved = max(1, min(requested_body_bytes, aggregate_remaining))
+            self._aggregate_reserved += reserved
+            return min(self.timeout, remaining), reserved
 
-    def _request_once(self, url: str, *, body_limit: int | None = None) -> Evidence:
-        timeout = self._reserve(url)
-        self._assert_public(url)
-        req = urllib.request.Request(url, headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/json,text/plain;q=0.8,*/*;q=0.1",
-            "Accept-Encoding": "identity",
-        })
-        limit = body_limit or self.max_body_bytes
-        try:
-            origin = self._origin(url)
-            with self._lock:
-                origin_lock = self._origin_locks.setdefault(origin, threading.Lock())
-            with self._semaphore:
-                # One origin is always serialized, including robots and redirect hops.
-                with origin_lock:
-                    try:
-                        response = self._opener.open(req, timeout=timeout)
-                    except urllib.error.HTTPError as exc:
-                        response = exc
-                    status = getattr(response, "status", response.getcode())
-                    headers = {k.lower(): v for k, v in response.headers.items()}
-                    body = response.read(limit + 1)
-                    if len(body) > limit:
-                        body = body[:limit]
-                        detail = f"body truncated at {limit} bytes"
-                    else:
-                        detail = ""
-            outcome = "ok" if 200 <= status < 300 else "http-error"
-            return Evidence(url, url, status, headers, body, [], outcome, detail)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            return Evidence(url, url, None, {}, b"", [], "network-error", str(exc))
-        finally:
-            with self._lock:
-                self._completed += 1
+    def _spacing_wait(self, origin: str) -> None:
+        with self._lock:
+            wait = max(0.0, self.spacing_seconds - (time.monotonic() - self._origin_last_start.get(origin, 0.0)))
+        if wait:
+            if wait >= self.remaining_seconds():
+                raise LimitError("global deadline would expire during same-origin spacing")
+            time.sleep(wait)
 
     @staticmethod
-    def _origin(url: str) -> str:
-        parts = urllib.parse.urlsplit(url)
-        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+    def _parse_headers(raw: bytes) -> tuple[int | None, dict[str, str]]:
+        text = raw.decode("latin-1", errors="replace")
+        starts = list(re.finditer(r"(?m)^HTTP/\S+\s+(\d{3})(?:\s+.*)?\r?$", text))
+        if not starts:
+            return None, {}
+        start = starts[-1]
+        headers: dict[str, str] = {}
+        for line in text[start.end():].replace("\r\n", "\n").split("\n"):
+            if not line.strip():
+                if headers:
+                    break
+                continue
+            if ":" in line:
+                key, value = line.split(":", 1)
+                headers[key.strip().casefold()] = value.strip()
+        return int(start.group(1)), headers
 
-    def _load_robots(self, url: str) -> tuple[bool, urllib.robotparser.RobotFileParser | None, str]:
+    @staticmethod
+    def _read(path: str) -> bytes:
+        try:
+            with open(path, "rb") as handle:
+                return handle.read()
+        except FileNotFoundError:
+            return b""
+
+    def _remember_response(self, url: str, result: Evidence) -> Evidence:
+        with self._lock:
+            attempt = len(self._response_cache.get(url, [])) + 1
+            result.cache_key = f"response:{url}#attempt-{attempt}"
+            self._response_cache.setdefault(url, []).append(result)
+        return result
+
+    def _curl_once(self, url: str, *, kind: str, body_limit: int) -> Evidence:
+        if not self._curl_path:
+            return Evidence(url, url, None, {}, b"", [], "network-error", "curl executable not found")
+        origin = self._origin(url)
+        with self._lock:
+            origin_lock = self._origin_locks.setdefault(origin, threading.Lock())
+        with origin_lock:
+            self._spacing_wait(origin)
+            timeout, effective_limit = self._reserve(url, kind, body_limit)
+            with self._lock:
+                self._origin_last_start[origin] = time.monotonic()
+            with self._cross_origin:
+                try:
+                    self._assert_public(url)
+                except UnsafeTarget as exc:
+                    with self._lock:
+                        self._completed += 1
+                        self._aggregate_reserved -= effective_limit
+                    return self._remember_response(
+                        url, Evidence(url, url, None, {}, b"", [], "network-error", str(exc)))
+                with tempfile.TemporaryDirectory(prefix="signaltrace-curl-") as temporary:
+                    headers_path = os.path.join(temporary, "headers")
+                    body_path = os.path.join(temporary, "body")
+                    command = [
+                        self._curl_path,
+                        "--silent", "--show-error", "--location", "--max-redirs", "0",
+                        "--max-time", f"{timeout:g}",
+                        "--connect-timeout", f"{min(self.connect_timeout, timeout):g}",
+                        "--user-agent", USER_AGENT,
+                        "--compressed", "--retry", "0",
+                        "--max-filesize", str(effective_limit),
+                        "--dump-header", headers_path, "--output", body_path,
+                        "--write-out", "%{http_code}\n%{url_effective}", url,
+                    ]
+                    try:
+                        process = subprocess.run(
+                            command, capture_output=True, text=True,
+                            timeout=max(1.0, self.remaining_seconds() + 0.25), check=False)
+                    except subprocess.TimeoutExpired:
+                        process = None
+                    except OSError as exc:
+                        process = exc
+                    header_bytes = self._read(headers_path)
+                    body = self._read(body_path)[:effective_limit]
+            status, headers = self._parse_headers(header_bytes)
+            with self._lock:
+                self._completed += 1
+                self._aggregate_bytes += len(body)
+                self._aggregate_reserved -= effective_limit
+            if process is None:
+                result = Evidence(url, url, status, headers, body, [], "timeout", "governor subprocess deadline")
+            elif isinstance(process, OSError):
+                result = Evidence(url, url, status, headers, body, [], "network-error", str(process))
+            else:
+                lines = process.stdout.splitlines()
+                if status is None and lines and lines[0].isdigit():
+                    status = int(lines[0]) or None
+                effective_url = lines[1] if len(lines) > 1 and lines[1] else url
+                error = process.stderr.strip()
+                if process.returncode == 28:
+                    outcome, detail = "timeout", error or "curl timed out"
+                elif status in REDIRECTS:
+                    outcome, detail = "redirect", error
+                elif process.returncode == 63:
+                    outcome, detail = "body-limit", f"response truncated at {effective_limit} bytes"
+                elif process.returncode != 0:
+                    outcome, detail = "network-error", error or f"curl exit {process.returncode}"
+                elif status is None:
+                    outcome, detail = "network-error", error or "curl returned no HTTP status"
+                elif 200 <= status < 300:
+                    outcome, detail = "ok", ""
+                else:
+                    outcome, detail = "http-error", f"HTTP {status}"
+                result = Evidence(url, effective_url, status, headers, body, [], outcome, detail, process.returncode)
+            return self._remember_response(url, result)
+
+    def _request_with_retries(self, url: str, *, kind: str, body_limit: int) -> Evidence:
+        result = self._curl_once(url, kind=kind, body_limit=body_limit)
+        for _ in range(self.retries):
+            retryable = result.outcome in {"timeout", "network-error"} or (
+                result.status is not None and result.status >= 500)
+            if not retryable or self.remaining_seconds() <= 0:
+                break
+            result = self._curl_once(url, kind="retry", body_limit=body_limit)
+        return result
+
+    def _load_robots(self, url: str) -> RobotsDecision:
         origin = self._origin(url)
         with self._lock:
             known = self._robots.get(origin)
             if known:
                 return known
-            wait_event = self._robots_inflight.get(origin)
-            if wait_event is None:
-                wait_event = threading.Event()
-                self._robots_inflight[origin] = wait_event
+            event = self._robots_inflight.get(origin)
+            if event is None:
+                event = threading.Event()
+                self._robots_inflight[origin] = event
                 owner = True
             else:
                 owner = False
         if not owner:
-            wait_event.wait(timeout=self.remaining_seconds())
+            event.wait(timeout=self.remaining_seconds())
             with self._lock:
-                return self._robots.get(
-                    origin, (False, None, "robots check did not complete before deadline"))
+                return self._robots.get(origin, RobotsDecision(
+                    "unreachable", False, "robots check did not complete before deadline"))
         robots_url = origin + "/robots.txt"
         try:
-            result = self._request_once(robots_url, body_limit=min(self.max_body_bytes, 262144))
-        except (LimitError, UnsafeTarget) as exc:
-            policy = (False, None, f"robots unavailable: {exc}")
-        else:
-            if result.status in {404, 410}:
-                policy = (True, None, "robots.txt not published")
-            elif result.status != 200:
-                policy = (False, None, f"robots unavailable with status {result.status}")
-            elif result.headers.get("location"):
-                policy = (False, None, "robots redirect not followed")
+            evidence = self._request_with_retries(
+                robots_url, kind="robots", body_limit=DEFAULTS.robots_body_limit_bytes)
+            if evidence.status in {404, 410}:
+                decision = RobotsDecision("missing", True, f"robots.txt returned HTTP {evidence.status}")
+            elif evidence.outcome == "timeout":
+                decision = RobotsDecision("timeout", False, evidence.detail)
+            elif evidence.status is None or evidence.outcome == "network-error":
+                decision = RobotsDecision("unreachable", False, evidence.detail)
+            elif evidence.status != 200:
+                decision = RobotsDecision("http-error", False, f"robots.txt returned HTTP {evidence.status}")
+            elif evidence.outcome == "body-limit" or b"\x00" in evidence.body:
+                decision = RobotsDecision("parser-error", False, "robots.txt was truncated or contained NUL bytes")
             else:
-                parser = urllib.robotparser.RobotFileParser()
                 try:
-                    parser.parse(result.text().splitlines())
-                    policy = (True, parser, "robots.txt parsed")
-                except Exception as exc:
-                    policy = (False, None, f"robots parse failure: {exc}")
-        with self._lock:
-            self._robots.setdefault(origin, policy)
-            self._robots_inflight.pop(origin, None)
-            wait_event.set()
-            return self._robots[origin]
+                    text = evidence.body.decode("utf-8", errors="strict")
+                    parser = urllib.robotparser.RobotFileParser()
+                    parser.set_url(robots_url)
+                    parser.parse(text.splitlines())
+                    decision = RobotsDecision("allowed", True, "robots.txt parsed", parser)
+                except (UnicodeDecodeError, ValueError) as exc:
+                    decision = RobotsDecision("parser-error", False, f"robots parser error: {exc}")
+        except (LimitError, UnsafeTarget) as exc:
+            decision = RobotsDecision("unreachable", False, str(exc))
+        finally:
+            with self._lock:
+                if "decision" not in locals():
+                    decision = RobotsDecision("unreachable", False, "robots check failed")
+                self._robots.setdefault(origin, decision)
+                self._robots_inflight.pop(origin, None)
+                event.set()
+        return decision
 
     def permission(self, url: str) -> tuple[bool, str]:
         normalized = self.normalize_url(url)
-        available, parser, reason = self._load_robots(normalized)
-        if not available:
-            return False, reason
-        if parser is not None and not parser.can_fetch(USER_AGENT, normalized):
-            return False, "robots.txt disallows this URL"
-        return True, reason
+        decision = self._load_robots(normalized)
+        if not decision.allowed_to_crawl:
+            return False, f"{decision.result}: {decision.detail}"
+        if decision.parser is not None and not decision.parser.can_fetch(USER_AGENT, normalized):
+            return False, "denied: robots.txt disallows this URL"
+        return True, f"{decision.result}: {decision.detail}"
 
-    def fetch(self, url: str, *, max_redirects: int = 5) -> Evidence:
+    def robots_result(self, url: str) -> dict[str, str]:
+        normalized = self.normalize_url(url)
+        decision = self._robots.get(self._origin(normalized))
+        if not decision:
+            return {"result": "not-checked", "detail": "robots policy not evaluated"}
+        allowed, reason = self.permission(normalized)
+        result = decision.result if allowed else ("denied" if reason.startswith("denied:") else decision.result)
+        return {"result": result, "detail": reason}
+
+    def fetch(self, url: str) -> Evidence:
         requested = self.normalize_url(url)
         with self._lock:
             cached = self._cache.get(requested)
             if cached:
                 return cached
-            wait_event = self._inflight.get(requested)
-            if wait_event is None:
-                wait_event = threading.Event()
-                self._inflight[requested] = wait_event
+            event = self._inflight.get(requested)
+            if event is None:
+                event = threading.Event()
+                self._inflight[requested] = event
                 owner = True
             else:
                 owner = False
         if not owner:
-            wait_event.wait(timeout=self.remaining_seconds())
+            event.wait(timeout=self.remaining_seconds())
             with self._lock:
                 cached = self._cache.get(requested)
             if cached:
                 return cached
             raise LimitError("deduplicated request did not complete before deadline")
         try:
-            current, chain = requested, []
-            seen = {requested}
-            for _ in range(max_redirects + 1):
+            current, chain, seen = requested, [], {requested}
+            for hop in range(self.max_redirects + 1):
                 allowed, reason = self.permission(current)
                 if not allowed:
                     with self._lock:
                         self._skipped += 1
-                    result = Evidence(requested, current, None, {}, b"", chain,
-                                      "robots-denied", reason)
+                    result = Evidence(requested, current, None, {}, b"", chain, "robots-denied", reason)
                     break
-                response = self._request_once(current)
-                response.requested_url = requested
-                response.redirect_chain = list(chain)
-                if response.status not in REDIRECTS:
-                    response.final_url = current
-                    result = response
+                evidence = self._request_with_retries(
+                    current, kind="target" if hop == 0 else "redirect", body_limit=self.max_body_bytes)
+                evidence.requested_url = requested
+                evidence.redirect_chain = list(chain)
+                if evidence.status not in REDIRECTS:
+                    evidence.final_url = current
+                    result = evidence
                     break
-                location = response.headers.get("location")
+                location = evidence.headers.get("location")
                 if not location:
-                    response.outcome = "unresolved-redirect"
-                    response.detail = "redirect response had no Location header"
-                    result = response
+                    evidence.outcome = "unresolved-redirect"
+                    evidence.detail = "redirect response had no Location header"
+                    result = evidence
                     break
                 target = self.normalize_url(urllib.parse.urljoin(current, location))
-                chain.append({"from": current, "status": response.status, "to": target})
+                chain.append({"from": current, "status": evidence.status, "to": target,
+                              "cache_key": evidence.cache_key})
+                with self._lock:
+                    self._redirects += 1
                 if target in seen:
-                    result = Evidence(requested, current, response.status, response.headers,
-                                      response.body, chain, "redirect-loop", "redirect loop")
+                    result = Evidence(requested, current, evidence.status, evidence.headers,
+                                      evidence.body, chain, "redirect-loop", "redirect loop")
                     break
                 seen.add(target)
                 current = target
@@ -301,4 +482,4 @@ class RequestGovernor:
         finally:
             with self._lock:
                 self._inflight.pop(requested, None)
-                wait_event.set()
+                event.set()

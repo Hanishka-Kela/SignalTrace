@@ -272,6 +272,35 @@ def content_engagement_audit(page: PageParser, url: str) -> tuple[list[dict], li
     return findings, unresolved
 
 
+def bot_directives_audit(page: PageParser, headers: dict[str, str], url: str,
+                         robots_result: dict[str, str]) -> tuple[list[dict], list[str]]:
+    """Evaluate cached search directives without creating a sixth skill."""
+    findings, unresolved = [], []
+    directives = []
+    if page.meta.get("robots"):
+        directives.extend(re.split(r"[,\s]+", page.meta["robots"].casefold()))
+    if headers.get("x-robots-tag"):
+        directives.extend(re.split(r"[,\s]+", headers["x-robots-tag"].casefold()))
+    directives = [item for item in directives if item]
+    if "index" in directives and "noindex" in directives:
+        findings.append(finding(
+            code="conflicting-index-directives",
+            title="Initial response publishes conflicting index directives",
+            severity="Medium", confidence=.98,
+            evidence={"meta_robots": page.meta.get("robots"),
+                      "x_robots_tag": headers.get("x-robots-tag")},
+            affected_url=url, evidence_type="http-headers/initial-html",
+            responsible_party="site-published link",
+            impact="Automated consumers receive contradictory eligibility instructions.",
+            suggested_action="Publish one intentional index eligibility directive consistently in HTML and HTTP headers.",
+            priority=64))
+    elif "noindex" in directives:
+        unresolved.append("bot-directives: noindex observed; treated as a deliberate restriction, not a defect")
+    if robots_result.get("result") == "denied":
+        unresolved.append("bot-directives: target denied by robots.txt; deliberate restriction is not a finding")
+    return findings, unresolved
+
+
 def page_identity(page: PageParser) -> dict[str, str | None]:
     h1 = next((h["text"] for h in page.headings if h["level"] == "h1" and h["text"]), None)
     return {"entity": h1 or page.meta.get("og:title") or page.title or None,

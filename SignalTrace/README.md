@@ -2,7 +2,7 @@
 
 > Trace what an AI can find, what it can prove, and where the visitor ends up.
 
-SignalTrace is a recommendation-only, read-only Agent Skill marketplace package for the Adobe University Hackathon Round 3. It audits public HTTP(S) pages for AI discoverability, citation correctness, and the on-site route an AI-referred visitor receives. It never changes the target site and uses only the Python standard library.
+SignalTrace is a recommendation-only, read-only Agent Skill marketplace package for the Adobe University Hackathon Round 3. It audits public HTTP(S) pages for AI discoverability, citation correctness, and the on-site route an AI-referred visitor receives. It never changes the target site. Python uses the installed `curl` executable for all HTTP traffic; no Python networking package is used.
 
 ## Package layout
 
@@ -40,11 +40,13 @@ Useful limits:
 
 ```bash
 python3 plugins/signaltrace/scripts/signaltrace.py \
-  --max-requests 12 --max-per-origin 6 --max-concurrency 3 --deadline 30 \
-  --timeout 8 --max-body-bytes 1500000 https://example.com/
+  --max-requests 20 --target-request-maximum 16 --max-per-origin 8 \
+  --max-concurrency 2 --deadline 30 --timeout 8 --connect-timeout 3 \
+  --max-body-bytes 2097152 --aggregate-body-bytes 12582912 \
+  --spacing 2 --retries 0 https://example.com/
 ```
 
-The request count and per-origin count include `robots.txt`. Redirects are followed manually, each new origin is checked first, same-origin requests are serialized, URLs are deduplicated, private/reserved network targets are rejected, and a denial is never retried through an alternate identity or URL. `robots.txt` 401/403, redirects, malformed responses, or temporary failures are treated as unavailable/denied; 404/410 means no policy was published.
+All defaults live in `plugins/signaltrace/scripts/config.py`. Request and per-origin counts include `robots.txt`, redirect hops, and retries. Redirects are advanced manually, each new origin is checked first, same-origin requests are serialized and spaced, cross-origin concurrency is capped at two, every response is cached, URLs are deduplicated, aggregate bytes are bounded, and private/reserved targets are rejected. A denial is never retried through an alternate identity or URL. Robots results distinguish denial, missing policy, unreachable policy, timeout, HTTP error, and parser error.
 
 Source verification is intentionally opt-in: only URLs explicitly provided in `sources` are fetched. If none are provided, that check reports `not assessed` through coverage rather than inventing corroboration.
 

@@ -12,13 +12,14 @@ import urllib.parse
 from typing import Any
 
 from analyzers import (
-    content_engagement_audit, deduplicate_findings, destination_observation,
+    bot_directives_audit, content_engagement_audit, deduplicate_findings, destination_observation,
     finding, parse_page, source_verification, structured_data_audit,
 )
 from runtime import Evidence, LimitError, RequestGovernor, UnsafeTarget
+from config import DEFAULTS
 
 CHECKS = [
-    "robots-policy", "target-fetch", "structured-data",
+    "robots-policy", "target-fetch", "bot-directives", "structured-data",
     "content-engagement", "citation-destination", "source-verification",
 ]
 
@@ -26,13 +27,19 @@ CHECKS = [
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run one read-only SignalTrace audit")
     parser.add_argument("site", nargs="?", help="public HTTP(S) target")
-    parser.add_argument("--max-requests", type=int, default=12)
-    parser.add_argument("--max-concurrency", type=int, default=3)
-    parser.add_argument("--max-per-origin", type=int, default=6)
-    parser.add_argument("--deadline", type=float, default=30.0)
-    parser.add_argument("--timeout", type=float, default=8.0)
-    parser.add_argument("--max-body-bytes", type=int, default=1_500_000)
-    parser.add_argument("--max-link-checks", type=int, default=3)
+    parser.add_argument("--max-requests", type=int, default=DEFAULTS.global_request_maximum)
+    parser.add_argument("--target-request-maximum", type=int, default=DEFAULTS.target_request_maximum)
+    parser.add_argument("--max-concurrency", type=int, default=DEFAULTS.cross_origin_concurrency)
+    parser.add_argument("--max-per-origin", type=int, default=DEFAULTS.per_origin_maximum)
+    parser.add_argument("--deadline", type=float, default=DEFAULTS.global_deadline_seconds)
+    parser.add_argument("--timeout", type=float, default=DEFAULTS.request_timeout_seconds)
+    parser.add_argument("--connect-timeout", type=float, default=DEFAULTS.connection_timeout_seconds)
+    parser.add_argument("--max-body-bytes", type=int, default=DEFAULTS.response_body_limit_bytes)
+    parser.add_argument("--aggregate-body-bytes", type=int, default=DEFAULTS.aggregate_body_limit_bytes)
+    parser.add_argument("--spacing", type=float, default=DEFAULTS.same_origin_spacing_seconds)
+    parser.add_argument("--retries", type=int, default=DEFAULTS.retries)
+    parser.add_argument("--max-redirects", type=int, default=DEFAULTS.maximum_redirects)
+    parser.add_argument("--max-link-checks", type=int, default=DEFAULTS.selected_link_maximum)
     return parser.parse_args()
 
 
@@ -107,6 +114,8 @@ def _audit_destination(governor: RequestGovernor, source_url: str,
         evidence = governor.fetch(link["url"])
     except (LimitError, UnsafeTarget) as exc:
         return [], [f"citation-destination: {link['url']} not assessed: {exc}"]
+    if evidence.outcome == "body-limit":
+        return [], [f"citation-destination: {link['url']} exceeded the response body limit; not assessed"]
     page = parse_page(evidence.text(), evidence.final_url) if _is_html(evidence) else None
     found, unresolved = destination_observation(link, source_url, evidence, page)
     for item in found:
@@ -121,6 +130,8 @@ def _fetch_source(governor: RequestGovernor, url: str):
         return None, f"source-verification: {url} not assessed: {exc}"
     if evidence.outcome == "robots-denied":
         return None, f"source-verification: {url} restricted by robots; not assessed"
+    if evidence.outcome == "body-limit":
+        return None, f"source-verification: {url} exceeded the response body limit; not assessed"
     if evidence.status != 200 or not _is_html(evidence):
         return None, f"source-verification: {url} has no usable public HTML evidence"
     page = parse_page(evidence.text(), evidence.final_url)
@@ -137,11 +148,17 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     # Construction starts the deadline before URL normalization, DNS, or any network work.
     governor = RequestGovernor(
         max_requests=max(1, min(args.max_requests, 100)),
-        max_concurrency=max(1, min(args.max_concurrency, 10)),
+        target_request_maximum=max(1, min(args.target_request_maximum, 100)),
+        max_concurrency=max(1, min(args.max_concurrency, 2)),
         timeout=max(.1, min(args.timeout, 60.0)),
+        connect_timeout=max(.1, min(args.connect_timeout, 30.0)),
         max_body_bytes=max(1024, min(args.max_body_bytes, 10_000_000)),
+        aggregate_body_bytes=max(1024, min(args.aggregate_body_bytes, 100_000_000)),
         deadline_seconds=max(.1, min(args.deadline, 300.0)),
         max_per_origin=max(2, min(args.max_per_origin, 50)),
+        spacing_seconds=max(0.0, min(args.spacing, 60.0)),
+        retries=max(0, min(args.retries, 3)),
+        max_redirects=max(0, min(args.max_redirects, 10)),
     )
     requested_site = str(payload["site"])
     findings: list[dict[str, Any]] = []
@@ -203,7 +220,11 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
         ])
         return _report(site, governor, findings, completed, unresolved)
 
+    if target.outcome == "body-limit":
+        unresolved.append("target-fetch: response exceeded the body limit; checks use only cached partial evidence")
+
     page = parse_page(target.text(), target.final_url)
+    robots_result = governor.robots_result(target.final_url)
     links = _explicit_citations(payload, target.final_url)
     observed = _select_links(page, target.final_url, args.max_link_checks)
     known_urls = {item["url"] for item in links}
@@ -217,6 +238,7 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     # Local parsing begins in parallel with independent, bounded network evidence tasks.
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(args.max_concurrency, 10))) as pool:
         local_futures = {
+            pool.submit(bot_directives_audit, page, target.headers, target.final_url, robots_result): "bot-directives",
             pool.submit(structured_data_audit, page, target.final_url): "structured-data",
             pool.submit(content_engagement_audit, page, target.final_url): "content-engagement",
         }
@@ -260,6 +282,10 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
     counts = {name: sum(1 for item in findings if item["severity"] == name)
               for name in ("Critical", "High", "Medium")}
     snapshot = governor.snapshot()
+    try:
+        robots_result = governor.robots_result(site)
+    except (UnsafeTarget, ValueError):
+        robots_result = {"result": "not-checked", "detail": "invalid or unsupported target URL"}
     actions, seen_actions = [], set()
     for item in findings:
         action = item["suggested_action"]
@@ -278,6 +304,14 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
             "requests_started": snapshot["requests_started"],
             "requests_completed": snapshot["requests_completed"],
             "requests_skipped": snapshot["requests_skipped"],
+            "target_requests_started": snapshot["target_requests_started"],
+            "redirects_observed": snapshot["redirects_observed"],
+            "retries_started": snapshot["retries_started"],
+            "response_bytes_cached": snapshot["response_bytes_cached"],
+            "elapsed_seconds": snapshot["elapsed_seconds"],
+            "robots_result": robots_result,
+            "subagent_facility_available": False,
+            "execution_mode": "local",
             "checks_completed": [name for name in CHECKS if name in set(completed)],
             "checks_unresolved": list(dict.fromkeys(unresolved)),
             "unresolved_checks": list(dict.fromkeys(unresolved)),

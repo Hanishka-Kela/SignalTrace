@@ -5,9 +5,9 @@ description: Run a complete read-only SignalTrace audit of a public website URL 
 
 # SignalTrace audit entrypoint
 
-Start the global deadline before any DNS or HTTP work. Read [the audit contract](../../references/audit-contract.md), then run `python3 ../../scripts/signaltrace.py <URL>` from this skill directory, or resolve that script to an absolute path first. If the harness supplies an input envelope, pipe that JSON object to stdin and do not add guessed targets.
+Start the global deadline before any DNS or HTTP work. Read [the audit contract](../../references/audit-contract.md) and [bot-directive rules](../../references/bot-directives.md), then run `python3 ../../scripts/signaltrace.py <URL>` from this skill directory, or resolve that script to an absolute path first. If the harness supplies an input envelope, pipe that JSON object to stdin and do not add guessed targets.
 
-The script is the authority for robots decisions, request budgets, concurrency, timeouts, redirect handling, body limits, URL deduplication, evidence caching, scope comparison, finding deduplication, severity, and final serialization. Do not perform side-channel network requests around it.
+The script is the authority for robots and bot-directive decisions, request budgets, concurrency, timeouts, redirect handling, body limits, URL deduplication, evidence caching, scope comparison, finding deduplication, severity, and final serialization. Its governor is the only component allowed to execute curl. Do not perform side-channel network requests around it.
 
 Specialists receive cached evidence first, and the complete audit must work with no delegation facility. If host delegation is available, read the optional delegation contract in [the audit contract](../../references/audit-contract.md). Delegate only a specific evidence dependency, never a finding or unrestricted crawl. Include the task identifier, cache references, permission status, remaining global and per-origin budgets, remaining time, maximum additional requests, and cancellation deadline. Workers never fetch directly; the entrypoint performs an explicitly granted request through its governor. Continue local parsing while independent bounded analysis runs, serialize same-origin network work, and cancel or ignore late output without turning it into a finding.
 
