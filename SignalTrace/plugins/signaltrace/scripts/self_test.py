@@ -15,12 +15,13 @@ import unittest
 from analyzers import (
     bot_directives_audit, content_engagement_audit, deduplicate_findings,
     deduplicate_opportunities, destination_observation, improvement_opportunity_audit,
-    parse_page, source_verification, structured_data_audit, visitor_journey_audit,
+    parse_page, same_as_declarations, same_as_destination_observation,
+    source_verification, structured_data_audit, visitor_journey_audit,
 )
 from runtime import Evidence, LimitError, RequestGovernor
 from config import DEFAULTS, USER_AGENT
 from scope import compare_scopes, normalize_scope
-from signaltrace import _select_journey_links
+from signaltrace import _audit_same_as, _select_journey_links
 
 
 class ScopeTests(unittest.TestCase):
@@ -107,6 +108,104 @@ class AnalyzerTests(unittest.TestCase):
             [("https://one.example/story", one), ("https://two.example/copy", two)],
             "https://shop.example/widget")
         self.assertTrue(any("duplicates" in item for item in unresolved))
+
+    def test_same_as_absence_is_not_applicable(self):
+        page = parse_page(
+            '<script type="application/ld+json">'
+            '{"@type":"Organization","name":"Main Street Bakery"}</script>',
+            "https://bakery.example/")
+        declarations, unresolved, status = same_as_declarations(page, page.base_url)
+        self.assertEqual(declarations, [])
+        self.assertEqual(unresolved, [])
+        self.assertEqual(status, "not applicable")
+
+    def test_person_same_as_is_extracted_from_shared_jsonld_nodes(self):
+        page = parse_page(
+            '<script type="application/ld+json">'
+            '{"@type":"Person","name":"Ada Example",'
+            '"sameAs":["https://profiles.example/ada"]}</script>',
+            "https://ada.example/")
+        declarations, unresolved, status = same_as_declarations(page, page.base_url)
+        self.assertEqual(status, "applicable")
+        self.assertEqual(unresolved, [])
+        self.assertEqual(declarations[0]["node_type"], "Person")
+
+    def test_same_as_robots_denial_is_coverage_only(self):
+        declaration = {"url": "https://social.example/acme", "brand": "Acme",
+                       "node_type": "Organization", "block": 1}
+        evidence = Evidence(declaration["url"], declaration["url"], None, {}, b"", [],
+                            "robots-denied", "denied: robots.txt disallows this URL")
+        findings, unresolved, result = same_as_destination_observation(
+            declaration, "https://acme.example/", evidence, None)
+        self.assertEqual(findings, [])
+        self.assertEqual(result["classification"], "robots-denied")
+        self.assertTrue(any("not assessed" in item for item in unresolved))
+
+    def test_same_as_documented_successor_redirect_is_not_broken(self):
+        declaration = {"url": "https://social.example/acme-bakery", "brand": "Acme Bakery",
+                       "node_type": "Organization", "block": 1}
+        final_url = "https://social.example/northstar-bakery"
+        evidence = Evidence(
+            declaration["url"], final_url, 200, {"content-type": "text/html"}, b"", [{
+                "from": declaration["url"], "status": 301, "to": final_url}], "ok")
+        destination = parse_page(
+            "<title>Northstar Bakery — formerly Acme Bakery</title>"
+            "<h1>Northstar Bakery</h1><p>Formerly Acme Bakery.</p>", final_url)
+        findings, unresolved, result = same_as_destination_observation(
+            declaration, "https://acme.example/", evidence, destination)
+        self.assertEqual(findings, [])
+        self.assertEqual(unresolved, [])
+        self.assertEqual(result["classification"], "redirects-to-materially-different-destination")
+        self.assertIs(result["documented_successor"], True)
+        self.assertEqual(result["identity_verdict"], "documented successor")
+
+    def test_single_legitimate_same_as_resolves_without_padding(self):
+        page = parse_page(
+            '<script type="application/ld+json">'
+            '{"@type":"Organization","name":"Main Street Bakery",'
+            '"sameAs":["https://social.example/main-street-bakery"]}</script>',
+            "https://bakery.example/")
+        declarations, unresolved, status = same_as_declarations(page, page.base_url)
+        self.assertEqual(status, "applicable")
+        self.assertEqual(unresolved, [])
+        destination = parse_page(
+            '<title>Main Street Bakery | Social</title>'
+            '<meta property="og:title" content="Main Street Bakery">', declarations[0]["url"])
+        evidence = Evidence(declarations[0]["url"], declarations[0]["url"], 200,
+                            {"content-type": "text/html"}, b"", [], "ok")
+        findings, notes, result = same_as_destination_observation(
+            declarations[0], page.base_url, evidence, destination)
+        self.assertEqual(findings, [])
+        self.assertEqual(notes, [])
+        self.assertEqual(result["classification"], "resolves-cleanly")
+        self.assertEqual(result["identity_verdict"], "plausible match")
+        self.assertTrue(any(item["result"] == "compatible"
+                            for item in result["scope_comparisons"]))
+
+    def test_dead_same_as_is_a_high_identity_finding(self):
+        declaration = {"url": "https://social.example/missing", "brand": "Acme",
+                       "node_type": "Organization", "block": 1}
+        evidence = Evidence(declaration["url"], declaration["url"], 404, {}, b"", [],
+                            "http-error", "HTTP 404")
+        findings, unresolved, result = same_as_destination_observation(
+            declaration, "https://acme.example/", evidence, None)
+        self.assertEqual(unresolved, [])
+        self.assertEqual(result["classification"], "dead")
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["severity"], "High")
+
+    def test_parked_same_as_is_classified_from_explicit_page_text(self):
+        declaration = {"url": "https://profile.example/acme", "brand": "Acme",
+                       "node_type": "Organization", "block": 1}
+        destination = parse_page(
+            "<title>Buy this domain</title><p>This domain is for sale.</p>", declaration["url"])
+        evidence = Evidence(declaration["url"], declaration["url"], 200,
+                            {"content-type": "text/html"}, b"", [], "ok")
+        findings, unresolved, result = same_as_destination_observation(
+            declaration, "https://acme.example/", evidence, destination)
+        self.assertEqual(unresolved, [])
+        self.assertEqual(result["classification"], "squatted-or-parked")
+        self.assertEqual(findings[0]["severity"], "High")
 
 
 class ImprovementOpportunityTests(unittest.TestCase):
@@ -261,6 +360,25 @@ class RuntimeTests(unittest.TestCase):
         result = governor.fetch("https://example.com/private")
         self.assertEqual(result.outcome, "robots-denied")
         self.assertEqual(calls, ["https://example.com/robots.txt"])
+
+    def test_same_as_fetch_uses_governor_and_stops_at_robots_denial(self):
+        governor = RequestGovernor(max_requests=3, max_concurrency=1, timeout=1,
+                                   max_body_bytes=1000, deadline_seconds=3, max_per_origin=3,
+                                   spacing_seconds=0)
+        calls = []
+        def fake_request(url, *, kind, body_limit):
+            calls.append(url)
+            return Evidence(url, url, 200, {"content-type": "text/plain"},
+                            b"User-agent: *\nDisallow: /acme\n", [], "ok")
+        governor._request_with_retries = fake_request  # type: ignore[method-assign]
+        declaration = {"url": "https://social.example/acme", "brand": "Acme",
+                       "node_type": "Organization", "block": 1}
+        findings, unresolved, result = _audit_same_as(
+            governor, "https://acme.example/", declaration)
+        self.assertEqual(findings, [])
+        self.assertTrue(any("not assessed" in item for item in unresolved))
+        self.assertEqual(result["classification"], "robots-denied")
+        self.assertEqual(calls, ["https://social.example/robots.txt"])
 
     def test_concurrent_same_origin_fetches_share_one_robots_request(self):
         governor = RequestGovernor(max_requests=5, max_concurrency=2, timeout=1,

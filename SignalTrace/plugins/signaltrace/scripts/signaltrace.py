@@ -15,7 +15,7 @@ from analyzers import (
     bot_directives_audit, content_engagement_audit, deduplicate_findings,
     classify_link, deduplicate_opportunities, destination_observation, finding,
     improvement_opportunity_audit, parse_page, source_verification, structured_data_audit,
-    visitor_journey_audit,
+    same_as_declarations, same_as_destination_observation, visitor_journey_audit,
 )
 from runtime import Evidence, LimitError, RequestGovernor, UnsafeTarget
 from config import DEFAULTS
@@ -23,7 +23,7 @@ from config import DEFAULTS
 CHECKS = [
     "robots-policy", "target-fetch", "bot-directives", "structured-data",
     "content-engagement", "citation-destination", "source-verification",
-    "visitor-journey", "improvement-opportunities",
+    "sameAs-identity", "visitor-journey", "improvement-opportunities",
 ]
 
 
@@ -188,6 +188,29 @@ def _audit_destination(governor: RequestGovernor, source_url: str,
     return found, unresolved
 
 
+def _audit_same_as(governor: RequestGovernor, source_url: str,
+                   declaration: dict[str, Any]) -> tuple[list[dict], list[str], dict[str, Any]]:
+    try:
+        evidence = governor.fetch(declaration["url"])
+    except (LimitError, UnsafeTarget) as exc:
+        return [], [f"sameAs-identity: {declaration['url']} not assessed: {exc}"], {
+            "declared_url": declaration["url"], "brand": declaration.get("brand", ""),
+            "node_type": declaration.get("node_type"), "block": declaration.get("block"),
+            "classification": "not-assessed", "identity_verdict": "not assessed",
+            "detail": str(exc),
+        }
+    if evidence.outcome == "body-limit":
+        return [], [f"sameAs-identity: {declaration['url']} exceeded the body limit; not assessed"], {
+            "declared_url": declaration["url"], "brand": declaration.get("brand", ""),
+            "node_type": declaration.get("node_type"), "block": declaration.get("block"),
+            "classification": "inconclusive", "identity_verdict": "not assessed",
+            "status": evidence.status, "final_url": evidence.final_url,
+            "redirect_chain": evidence.redirect_chain, "detail": evidence.detail,
+        }
+    page = parse_page(evidence.text(), evidence.final_url) if _is_html(evidence) else None
+    return same_as_destination_observation(declaration, source_url, evidence, page)
+
+
 def _fetch_journey(governor: RequestGovernor, source_url: str,
                    link: dict[str, str]) -> dict[str, Any]:
     """Fetch one entrypoint-selected route; never selects or follows child links."""
@@ -266,6 +289,8 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     completed, unresolved = [], []
     journey_coverage: dict[str, list[dict[str, Any]]] = {
         "selected_links": [], "crawled_links": [], "skipped_links": []}
+    same_as_coverage: dict[str, Any] = {
+        "status": "not assessed", "declared": 0, "results": []}
     try:
         site = governor.normalize_url(requested_site)
     except (UnsafeTarget, ValueError) as exc:
@@ -286,6 +311,7 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             "structured-data: not assessed without permitted target evidence",
             "content-engagement: not assessed without permitted target evidence",
             "citation-destination: not assessed without permitted target evidence",
+            "sameAs-identity: not assessed without permitted target evidence",
             "source-verification: not assessed because the primary target was unavailable",
         ])
         return _report(site, governor, findings, completed, unresolved)
@@ -295,6 +321,7 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             "structured-data: not assessed without target HTML",
             "content-engagement: not assessed without target HTML",
             "citation-destination: not assessed without target HTML",
+            "sameAs-identity: not assessed without target HTML",
             "source-verification: primary target unavailable",
         ])
         return _report(site, governor, findings, completed, unresolved)
@@ -319,6 +346,7 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             "structured-data: target is not an HTML representation",
             "content-engagement: target is not an HTML representation",
             "citation-destination: no HTML links available",
+            "sameAs-identity: target is not an HTML representation",
             "source-verification: not assessed for non-HTML primary evidence",
         ])
         return _report(site, governor, findings, completed, unresolved)
@@ -327,6 +355,12 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
         unresolved.append("target-fetch: response exceeded the body limit; checks use only cached partial evidence")
 
     page = parse_page(target.text(), target.final_url)
+    same_as_items, same_as_notes, same_as_applicability = same_as_declarations(page, target.final_url)
+    same_as_coverage["declared"] = len(same_as_items)
+    same_as_coverage["status"] = same_as_applicability
+    unresolved.extend(same_as_notes)
+    if not same_as_items:
+        completed.append("sameAs-identity")
     robots_result = governor.robots_result(target.final_url)
     if robots_result.get("result") not in {"allowed", "missing"}:
         unresolved.append(
@@ -356,6 +390,8 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
                            for link in journey_links]
         destination_futures = [pool.submit(_audit_destination, governor, target.final_url, link)
                                for link in citations if link["url"] not in {item["url"] for item in journey_links}]
+        same_as_futures = [pool.submit(_audit_same_as, governor, target.final_url, item)
+                           for item in same_as_items]
         source_futures = [pool.submit(_fetch_source, governor, url) for url in sources]
         for future, name in local_futures.items():
             try:
@@ -408,6 +444,24 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             except Exception as exc:
                 unresolved.append(f"citation-destination: check did not complete: {exc}")
         completed.append("citation-destination")
+        same_as_has_finding = False
+        same_as_incomplete = bool(same_as_notes)
+        for future in same_as_futures:
+            try:
+                found, notes, result = future.result(timeout=max(.01, governor.remaining_seconds()))
+                findings.extend(found)
+                unresolved.extend(notes)
+                same_as_coverage["results"].append(result)
+                same_as_has_finding = same_as_has_finding or bool(found)
+                same_as_incomplete = same_as_incomplete or bool(notes)
+            except Exception as exc:
+                same_as_incomplete = True
+                unresolved.append(f"sameAs-identity: check did not complete: {exc}")
+        if same_as_items:
+            same_as_coverage["status"] = (
+                "confirmed finding" if same_as_has_finding else
+                "inconclusive" if same_as_incomplete else "passed")
+            completed.append("sameAs-identity")
         for future in source_futures:
             try:
                 result, note = future.result(timeout=max(.01, governor.remaining_seconds()))
@@ -421,13 +475,15 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     findings.extend(found)
     unresolved.extend(notes)
     completed.append("source-verification")
-    return _report(site, governor, findings, completed, unresolved, opportunities, journey_coverage)
+    return _report(site, governor, findings, completed, unresolved, opportunities,
+                   journey_coverage, same_as_coverage)
 
 
 def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]],
             completed: list[str], unresolved: list[str],
             opportunities: list[dict[str, Any]] | None = None,
-            journey_coverage: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
+            journey_coverage: dict[str, list[dict[str, Any]]] | None = None,
+            same_as_coverage: dict[str, Any] | None = None) -> dict[str, Any]:
     findings = deduplicate_findings(findings)
     opportunities = deduplicate_opportunities(opportunities or [])
     counts = {name: sum(1 for item in findings if item["severity"] == name)
@@ -461,6 +517,8 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
             "unresolved_checks": list(dict.fromkeys(unresolved)),
             "journey": journey_coverage or {
                 "selected_links": [], "crawled_links": [], "skipped_links": []},
+            "sameAs_identity": same_as_coverage or {
+                "status": "not assessed", "declared": 0, "results": []},
         },
         "findings": findings,
         "suggested_actions": opportunities,

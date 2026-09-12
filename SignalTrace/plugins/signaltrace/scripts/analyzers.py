@@ -81,6 +81,8 @@ class PageParser(HTMLParser):
         self.script_chars = 0
         self._stack: list[dict[str, Any]] = []
         self._jsonld_buffer: list[str] | None = None
+        self._jsonld_parse_cache: tuple[list[tuple[int, dict[str, Any]]],
+                                        list[dict[str, Any]]] | None = None
 
     def handle_starttag(self, tag: str, attrs_list):
         attrs = {k.lower(): (v or "") for k, v in attrs_list}
@@ -241,11 +243,35 @@ def _types(node: dict[str, Any]) -> set[str]:
     return {str(item).rsplit("/", 1)[-1].casefold() for item in value}
 
 
-def structured_data_audit(page: PageParser, url: str) -> tuple[list[dict], list[str]]:
-    findings, unresolved = [], []
-    parsed_nodes: list[tuple[int, dict[str, Any]]] = []
+def parsed_jsonld_nodes(page: PageParser) -> tuple[list[tuple[int, dict[str, Any]]],
+                                                   list[dict[str, Any]]]:
+    """Parse JSON-LD once so structured-data and identity checks share nodes."""
+    if page._jsonld_parse_cache is not None:
+        return page._jsonld_parse_cache
+    nodes: list[tuple[int, dict[str, Any]]] = []
+    errors: list[dict[str, Any]] = []
     for index, raw in enumerate(page.jsonld, 1):
         if not raw:
+            errors.append({"block": index, "kind": "empty", "excerpt": ""})
+            continue
+        try:
+            data = json.loads(raw)
+            nodes.extend((index, node) for node in _walk_jsonld(data))
+        except json.JSONDecodeError as exc:
+            errors.append({
+                "block": index, "kind": "invalid", "line": exc.lineno,
+                "column": exc.colno, "message": exc.msg, "excerpt": compact(raw),
+            })
+    page._jsonld_parse_cache = (nodes, errors)
+    return page._jsonld_parse_cache
+
+
+def structured_data_audit(page: PageParser, url: str) -> tuple[list[dict], list[str]]:
+    findings, unresolved = [], []
+    parsed_nodes, parse_errors = parsed_jsonld_nodes(page)
+    for error in parse_errors:
+        index = error["block"]
+        if error["kind"] == "empty":
             findings.append(finding(
                 code="jsonld-empty", title="JSON-LD block is empty", severity="Medium",
                 confidence=1.0, evidence={"block": index, "excerpt": ""}, affected_url=url,
@@ -253,19 +279,15 @@ def structured_data_audit(page: PageParser, url: str) -> tuple[list[dict], list[
                 impact="A machine-readable representation is present but cannot be parsed.",
                 suggested_action=f"Remove or populate JSON-LD block {index} with valid scoped data.", priority=60))
             continue
-        try:
-            data = json.loads(raw)
-            parsed_nodes.extend((index, node) for node in _walk_jsonld(data))
-        except json.JSONDecodeError as exc:
-            findings.append(finding(
-                code="jsonld-invalid", title="JSON-LD block contains invalid JSON", severity="Medium",
-                confidence=1.0,
-                evidence={"block": index, "line": exc.lineno, "column": exc.colno,
-                          "message": exc.msg, "excerpt": compact(raw)}, affected_url=url,
-                evidence_type="initial-html/json-ld", responsible_party="site-published link",
-                impact="Consumers cannot parse this structured-data block.",
-                suggested_action=f"Correct JSON syntax in JSON-LD block {index} at line {exc.lineno}, column {exc.colno}.",
-                priority=65))
+        findings.append(finding(
+            code="jsonld-invalid", title="JSON-LD block contains invalid JSON", severity="Medium",
+            confidence=1.0,
+            evidence={"block": index, "line": error["line"], "column": error["column"],
+                      "message": error["message"], "excerpt": error["excerpt"]}, affected_url=url,
+            evidence_type="initial-html/json-ld", responsible_party="site-published link",
+            impact="Consumers cannot parse this structured-data block.",
+            suggested_action=f"Correct JSON syntax in JSON-LD block {index} at line {error['line']}, column {error['column']}.",
+            priority=65))
     rules = {
         "product": (("name",), ("offers", "aggregateRating", "review", "sku", "description")),
         "article": (("headline",), ()),
@@ -801,6 +823,234 @@ def page_identity(page: PageParser) -> dict[str, str | None]:
     return {"entity": h1 or page.meta.get("og:title") or page.title or None,
             "predicate": "identity", "value": h1 or page.title or None,
             "source_location": "final destination"}
+
+
+def same_as_declarations(page: PageParser, site_url: str) -> tuple[list[dict[str, Any]],
+                                                                  list[str], str]:
+    """Extract external Organization/Person sameAs claims from shared parsed JSON-LD."""
+    parsed_nodes, _ = parsed_jsonld_nodes(page)
+    site_origin = urllib.parse.urlsplit(site_url).netloc.casefold()
+    declarations: list[dict[str, Any]] = []
+    unresolved: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    saw_property = False
+    visible_name = str(page_identity(page).get("value") or "").strip()
+    for block, node in parsed_nodes:
+        identity_types = _types(node) & {"organization", "person"}
+        if not identity_types or "sameAs" not in node:
+            continue
+        saw_property = True
+        raw_values = node.get("sameAs")
+        values = raw_values if isinstance(raw_values, list) else [raw_values]
+        brand = str(node.get("name") or visible_name).strip()
+        for raw in values:
+            value = raw.get("@id") if isinstance(raw, dict) else raw
+            if not isinstance(value, str) or not value.strip():
+                unresolved.append(
+                    f"sameAs-identity: JSON-LD block {block} contains a non-URL sameAs value; not assessed")
+                continue
+            url = value.strip()
+            try:
+                parts = urllib.parse.urlsplit(url)
+                if parts.scheme.casefold() not in {"http", "https"} or not parts.hostname:
+                    raise ValueError("not an absolute HTTP(S) URL")
+            except ValueError as exc:
+                unresolved.append(
+                    f"sameAs-identity: JSON-LD block {block} value {compact(url)} is invalid: {exc}; not assessed")
+                continue
+            if parts.netloc.casefold() == site_origin:
+                unresolved.append(
+                    f"sameAs-identity: {url} is same-origin rather than an external identity URL; not assessed")
+                continue
+            key = (url, brand.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            declarations.append({
+                "url": url, "brand": brand, "block": block,
+                "node_type": sorted(identity_types)[0].title(),
+            })
+    if declarations:
+        return declarations, unresolved, "applicable"
+    if saw_property:
+        return [], unresolved, "inconclusive"
+    return [], unresolved, "not applicable"
+
+
+def _identity_candidates(page: PageParser) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    h1 = next((item["text"] for item in page.headings
+               if item["level"] == "h1" and item["text"]), "")
+    values = (
+        ("h1", h1),
+        ("og:title", page.meta.get("og:title", "")),
+        ("twitter:title", page.meta.get("twitter:title", "")),
+        ("title", page.title),
+        ("profile:username", page.meta.get("profile:username", "")),
+        ("og:site_name", page.meta.get("og:site_name", "")),
+    )
+    seen: set[str] = set()
+    for source, value in values:
+        cleaned = compact(value)
+        if cleaned and cleaned.casefold() not in seen:
+            seen.add(cleaned.casefold())
+            candidates.append({"source": source, "value": cleaned})
+    nodes, _ = parsed_jsonld_nodes(page)
+    for _, node in nodes:
+        if _types(node) & {"organization", "person", "profilepage"} and node.get("name"):
+            cleaned = compact(str(node["name"]))
+            if cleaned.casefold() not in seen:
+                seen.add(cleaned.casefold())
+                candidates.append({"source": "destination JSON-LD", "value": cleaned})
+    return candidates
+
+
+def _normalized_identity(value: str) -> str:
+    scoped = normalize_scope({"entity": "sameAs claim", "predicate": "identity", "value": value})
+    return str(scoped["value"] or "")
+
+
+def _documented_successor(brand: str, page: PageParser) -> bool:
+    if not brand:
+        return False
+    h1 = next((item["text"] for item in page.headings
+               if item["level"] == "h1" and item["text"]), "")
+    text = compact(" ".join((
+        page.title, h1, page.meta.get("description", ""),
+        page.meta.get("og:description", ""), page.meta.get("twitter:description", ""))), 4000)
+    name = re.escape(brand)
+    return bool(re.search(
+        rf"(?:formerly|previously known as)\s+{name}\b|\b{name}\s+(?:is now|became|rebranded as)\b",
+        text, re.I))
+
+
+def same_as_destination_observation(declaration: dict[str, Any], source_url: str,
+                                    evidence, destination_page: PageParser | None
+                                    ) -> tuple[list[dict], list[str], dict[str, Any]]:
+    """Classify one governor-fetched sameAs identity destination."""
+    declared_url = declaration["url"]
+    brand = declaration.get("brand", "")
+    result: dict[str, Any] = {
+        "declared_url": declared_url,
+        "brand": brand,
+        "node_type": declaration.get("node_type"),
+        "block": declaration.get("block"),
+        "classification": "inconclusive",
+        "identity_verdict": "not assessed",
+        "status": evidence.status,
+        "final_url": evidence.final_url,
+        "redirect_chain": evidence.redirect_chain,
+    }
+    findings: list[dict[str, Any]] = []
+    unresolved: list[str] = []
+    if evidence.outcome == "robots-denied":
+        result["classification"] = "robots-denied"
+        unresolved.append(f"sameAs-identity: {declared_url} denied by robots.txt; not assessed")
+        return findings, unresolved, result
+
+    dead_outcomes = {"unresolved-redirect", "redirect-loop", "redirect-limit"}
+    is_http_dead = evidence.status is not None and evidence.status >= 400
+    if evidence.outcome in {"timeout", "network-error"}:
+        result["classification"] = "dead"
+        unresolved.append(
+            f"sameAs-identity: {declared_url} could not be reached ({evidence.outcome}); identity claim not assessed")
+        return findings, unresolved, result
+    if evidence.outcome in dead_outcomes or is_http_dead:
+        result["classification"] = "dead"
+        findings.append(finding(
+            code="sameas-dead", title="Published sameAs identity URL is dead",
+            severity="High", confidence=.98,
+            evidence={"brand": brand, "declared_url": declared_url,
+                      "status": evidence.status, "outcome": evidence.outcome,
+                      "detail": evidence.detail, "redirect_chain": evidence.redirect_chain},
+            affected_url=source_url, evidence_type="json-ld/sameAs/http-destination-chain",
+            responsible_party="site-published link",
+            impact="The site publishes an external identity claim whose destination cannot be reached.",
+            suggested_action="Replace or remove the dead sameAs URL after verifying the intended public identity profile.",
+            priority=90))
+        return findings, unresolved, result
+
+    declared_parts = urllib.parse.urlsplit(declared_url)
+    final_parts = urllib.parse.urlsplit(evidence.final_url)
+    material_redirect = bool(evidence.redirect_chain) and (
+        declared_parts.netloc.casefold() != final_parts.netloc.casefold() or
+        declared_parts.path.rstrip("/").casefold() != final_parts.path.rstrip("/").casefold())
+    result["classification"] = (
+        "redirects-to-materially-different-destination" if material_redirect else "resolves-cleanly")
+    if destination_page is None:
+        unresolved.append(
+            f"sameAs-identity: {declared_url} resolved without usable public HTML identity evidence; not assessed")
+        return findings, unresolved, result
+
+    parked_identity_text = " ".join(item["value"] for item in _identity_candidates(destination_page))
+    parked_identity_text += " " + destination_page.meta.get("description", "")
+    parked = re.search(
+        r"\b(?:this domain is for sale|buy this domain|domain (?:is )?parked|sedo domain parking|"
+        r"afternic|parkingcrew)\b", parked_identity_text, re.I)
+    if parked:
+        result["classification"] = "squatted-or-parked"
+        result["identity_verdict"] = "conflicting"
+        findings.append(finding(
+            code="sameas-parked", title="Published sameAs identity URL resolves to a parked or for-sale page",
+            severity="High", confidence=.98,
+            evidence={"brand": brand, "declared_url": declared_url,
+                      "final_url": evidence.final_url, "observed": compact(parked.group(0)),
+                      "redirect_chain": evidence.redirect_chain}, affected_url=source_url,
+            evidence_type="json-ld/sameAs/destination-visible-text",
+            responsible_party="site-published link",
+            impact="The published identity claim resolves to a destination that presents itself as parked or for sale.",
+            suggested_action="Remove the identity claim or replace it with a verified profile controlled by the named entity.",
+            priority=92))
+        return findings, unresolved, result
+
+    candidates = _identity_candidates(destination_page)
+    result["destination_identity"] = candidates[:8]
+    exact_results = []
+    brand_normalized = _normalized_identity(brand)
+    plausible = False
+    for candidate in candidates:
+        compared = compare_scopes(
+            {"entity": "sameAs claim", "predicate": "identity", "value": brand},
+            {"entity": "sameAs claim", "predicate": "identity", "value": candidate["value"]})
+        exact_results.append({"source": candidate["source"], "result": compared})
+        candidate_normalized = _normalized_identity(candidate["value"])
+        if compared == "compatible" or (brand_normalized and candidate_normalized and
+                (brand_normalized in candidate_normalized or candidate_normalized in brand_normalized)):
+            plausible = True
+    result["scope_comparisons"] = exact_results
+    successor = _documented_successor(brand, destination_page)
+    result["documented_successor"] = successor
+    if successor:
+        result["identity_verdict"] = "documented successor"
+        return findings, unresolved, result
+    if plausible:
+        result["identity_verdict"] = "plausible match"
+        return findings, unresolved, result
+
+    generic = re.compile(
+        r"^(?:facebook|instagram|linkedin|twitter|x|youtube|tiktok|wikipedia|crunchbase|"
+        r"home|log ?in|sign ?in|page not found)(?:\W.*)?$", re.I)
+    positive = [item for item in candidates
+                if item["source"] != "og:site_name" and not generic.match(item["value"].strip())]
+    if brand and positive:
+        result["identity_verdict"] = "conflicting"
+        findings.append(finding(
+            code="sameas-identity-mismatch",
+            title="Published sameAs destination states a different identity",
+            severity="High", confidence=.9,
+            evidence={"brand": brand, "declared_url": declared_url,
+                      "final_url": evidence.final_url, "destination_identity": positive[:5],
+                      "scope_comparisons": exact_results,
+                      "redirect_chain": evidence.redirect_chain}, affected_url=source_url,
+            evidence_type="json-ld/sameAs/destination-identity",
+            responsible_party="site-published link",
+            impact="The site's machine-readable identity claim points to a page that states a different entity name.",
+            suggested_action="Correct the sameAs URL or align it with the verified external identity for this entity.",
+            priority=91))
+    else:
+        unresolved.append(
+            f"sameAs-identity: {declared_url} resolved but exposed no comparable public identity name; not assessed")
+    return findings, unresolved, result
 
 
 def destination_observation(link: dict[str, str], source_url: str, evidence,
