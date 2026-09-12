@@ -67,6 +67,10 @@ Every audit is read-only: SignalTrace does not modify a live website, submit for
 
 A confirmed finding means the audit has direct evidence that something is failing, contradictory, or inaccessible. A suggested improvement means cached landing-page and sampled-journey evidence supports a reasonable way to strengthen discoverability, clarity, trust, navigation, availability handling, or visitor continuation, but failure has not been proven. Missing optional features are never promoted to findings merely because they are absent. Static HTML can support observations about labels, readable facts, links, controls, forms, and redirect outcomes; SignalTrace does not claim mobile or visual-design defects without browser rendering.
 
+The improvement specialist can also identify product-positioning and audience-communication opportunities. It extracts exact product or service facts from cached HTML and structured data, then tests whether supported use cases and attributes appear in titles, headings, descriptions, and category labels. Any `candidate_audience` is explicitly a hypothesis based on observed attributes—not a verified demographic—and generated headlines, taglines, labels, and search phrases are recommendations, not claims about likely performance. When the cached page does not support a use case, no audience is invented. A lone visible price is not treated as a budget tier; explicit threshold or value-tier wording is required.
+
+This analysis still uses only pages obtained through the same bounded, robots-aware request governor. It does not fetch competitor data unless a source is explicitly supplied, cannot establish conversion or actual customer behavior from static HTML, and never modifies a live website.
+
 ```json
 {
   "findings": [],

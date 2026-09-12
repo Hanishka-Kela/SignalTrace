@@ -268,6 +268,108 @@ class ImprovementOpportunityTests(unittest.TestCase):
             "initial HTML", "sampled internal page", "redirect chain", "robots.txt"})
         self.assertEqual(deduplicate_opportunities([item, dict(item)]), [item])
 
+    def test_running_attributes_produce_grounded_positioning_recommendation(self):
+        page = parse_page(
+            "<title>Catalog</title><h1>Product</h1>"
+            "<p>Roadstep is a running shoe for daily running with cushioning and a wide fit.</p>",
+            "https://shop.example/roadstep")
+        opportunities = improvement_opportunity_audit(page, page.base_url)
+        item = next(value for value in opportunities
+                    if value["id"] == "opportunity-positioning-use-case")
+        self.assertEqual(item["category"], "positioning")
+        self.assertEqual(item["candidate_use_case"], "daily recreational running")
+        self.assertIn("runners", item["candidate_audience"])
+        self.assertTrue(item["suggested_headlines"])
+        self.assertIsInstance(item["evidence"]["observed"], list)
+        self.assertTrue(all({"url", "field", "source_location", "exact_observed_text",
+                             "normalized_value", "confidence"}.issubset(observation)
+                            for observation in item["evidence"]["observed"]))
+        exact = " ".join(observation["exact_observed_text"]
+                         for observation in item["evidence"]["observed"])
+        self.assertIn("cushioning", exact)
+        self.assertIn("wide fit", exact)
+
+    def test_hiking_suggestions_require_hiking_and_trail_attributes(self):
+        unsupported = parse_page(
+            "<title>Catalog</title><h1>Product</h1><p>Summit is a hiking boot.</p>",
+            "https://shop.example/summit")
+        supported = parse_page(
+            "<title>Catalog</title><h1>Product</h1>"
+            "<p>Summit is a hiking boot with trail grip, water-resistant material, and ankle support.</p>",
+            "https://shop.example/summit")
+        unsupported_ids = {item["id"] for item in improvement_opportunity_audit(
+            unsupported, unsupported.base_url)}
+        self.assertFalse(any(item.startswith("opportunity-positioning")
+                             for item in unsupported_ids))
+        items = [item for item in improvement_opportunity_audit(supported, supported.base_url)
+                 if item["id"].startswith("opportunity-positioning")]
+        self.assertTrue(items)
+        generated = json.dumps(items).casefold()
+        self.assertIn("hiking", generated)
+        self.assertIn("trail", generated)
+
+    def test_laptop_bag_commuter_positioning_requires_work_evidence(self):
+        no_work = parse_page(
+            "<title>Bag</title><h1>Product</h1>"
+            "<p>A 15-inch laptop bag with a laptop compartment.</p>",
+            "https://shop.example/bag")
+        with_work = parse_page(
+            "<title>Bag</title><h1>Product</h1>"
+            "<p>A professional 15-inch laptop bag with professional styling and a laptop compartment.</p>",
+            "https://shop.example/bag")
+        no_work_items = [item for item in improvement_opportunity_audit(no_work, no_work.base_url)
+                         if item["id"].startswith("opportunity-positioning")]
+        self.assertEqual(no_work_items, [])
+        work_items = [item for item in improvement_opportunity_audit(with_work, with_work.base_url)
+                      if item["id"].startswith("opportunity-positioning")]
+        self.assertTrue(work_items)
+        self.assertTrue(all("office commuter" in item["candidate_audience"].casefold()
+                            for item in work_items))
+
+    def test_no_use_case_evidence_does_not_invent_an_audience(self):
+        page = parse_page(
+            "<title>Northwind Object</title><h1>Northwind Object</h1>"
+            "<p>Available in blue. Price £20.</p>", "https://shop.example/object")
+        positioning = [item for item in improvement_opportunity_audit(page, page.base_url)
+                       if item["id"].startswith("opportunity-positioning")]
+        self.assertEqual(positioning, [])
+
+    def test_matching_specific_heading_suppresses_positioning_gap(self):
+        page = parse_page(
+            "<title>Wide-Fit Cushioned Running Shoes</title>"
+            "<h1>Wide-Fit Cushioned Running Shoes</h1>"
+            "<p>Running shoes with cushioning and a wide fit.</p>",
+            "https://shop.example/running")
+        positioning = [item for item in improvement_opportunity_audit(page, page.base_url)
+                       if item["id"].startswith("opportunity-positioning")]
+        self.assertEqual(positioning, [])
+
+    def test_generated_copy_never_adds_unobserved_high_risk_claims(self):
+        page = parse_page(
+            "<title>Catalog</title><h1>Product</h1>"
+            "<p>Running shoes with cushioning, a wide fit, and recycled rubber.</p>",
+            "https://shop.example/running")
+        positioning = [item for item in improvement_opportunity_audit(page, page.base_url)
+                       if item["id"].startswith("opportunity-positioning")]
+        generated = json.dumps(positioning).casefold()
+        for phrase in ("professional athlete", "carbon-neutral", "injury-proof",
+                       "increase conversions", "best in"):
+            self.assertNotIn(phrase, generated)
+
+    def test_independent_positioning_gaps_are_grouped_and_deduplicated(self):
+        page = parse_page(
+            "<title>Catalog</title><h1>Product</h1>"
+            "<p>Running shoes for daily running with cushioning, a wide fit, recycled rubber, "
+            "and a price under ₹6,000.</p>", "https://shop.example/running")
+        positioning = [item for item in improvement_opportunity_audit(page, page.base_url)
+                       if item["id"].startswith("opportunity-positioning")]
+        self.assertGreaterEqual(len(positioning), 4)
+        merged = deduplicate_opportunities(positioning + [dict(item) for item in positioning])
+        merged_positioning = [item for item in merged
+                              if item["id"].startswith("opportunity-positioning")]
+        self.assertEqual(len(merged_positioning), len(positioning))
+        self.assertEqual(len({item["id"] for item in positioning}), len(positioning))
+
 
 class VisitorJourneyTests(unittest.TestCase):
     def test_multi_page_fixture_selects_roles_and_broken_link_is_confirmed(self):
@@ -344,6 +446,23 @@ class VisitorJourneyTests(unittest.TestCase):
         self.assertGreaterEqual(len(combined), 3)
         self.assertTrue({"opportunity-structured-data", "opportunity-value-proposition",
                          "opportunity-control-labels"}.issubset({item["id"] for item in combined}))
+
+    def test_positive_listing_detail_activity_conflict_is_a_positioning_opportunity(self):
+        landing = parse_page(
+            "<h1>Footwear</h1><article><a href='/product/stride'>Hiking shoe</a>"
+            "<p>Hiking footwear with trail grip.</p></article>", "https://shop.example/")
+        detail = parse_page(
+            "<title>Stride</title><h1>Product</h1>"
+            "<p>Stride is a running shoe with cushioning and a wide fit.</p>",
+            "https://shop.example/product/stride")
+        link = next(item for item in landing.links if item["url"].endswith("/product/stride"))
+        _, opportunities, _ = visitor_journey_audit(landing, landing.base_url, [{
+            "role": "detail", "url": detail.base_url, "page": detail, "link": link}])
+        item = next(value for value in opportunities
+                    if value["id"] == "opportunity-positioning-listing-detail-terminology")
+        self.assertIs(item["is_finding"], False)
+        self.assertIn("Hiking", item["evidence"]["observed"][0]["exact_observed_text"])
+        self.assertEqual(item["candidate_use_case"], "recreational running")
 
 
 class RuntimeTests(unittest.TestCase):

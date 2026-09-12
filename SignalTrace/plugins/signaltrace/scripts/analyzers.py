@@ -78,6 +78,7 @@ class PageParser(HTMLParser):
         self.canonicals: list[str] = []
         self.visible_chunks: list[str] = []
         self.content_chunks: list[str] = []
+        self.text_elements: list[dict[str, str]] = []
         self.script_chars = 0
         self._stack: list[dict[str, Any]] = []
         self._jsonld_buffer: list[str] | None = None
@@ -156,6 +157,8 @@ class PageParser(HTMLParser):
         node = nodes[0]
         text = compact(" ".join(node["text"]))
         attrs = node["attrs"]
+        if tag in {"p", "li", "dt", "dd", "td", "th"} and text:
+            self.text_elements.append({"tag": tag, "text": text})
         if tag == "title":
             self.title = text
         elif tag == "a" and attrs.get("href"):
@@ -403,6 +406,467 @@ def bot_directives_audit(page: PageParser, headers: dict[str, str], url: str,
     return findings, unresolved
 
 
+_ACTIVITY_PATTERNS = {
+    "running": r"\b(?:running|daily runs?|jogging)\b",
+    "trail activity": r"\b(?:trail|trail running)\b",
+    "hiking": r"\b(?:hiking|trekking)\b",
+    "office commuting": r"\b(?:office|professional|work|commut(?:e|er|ing)|business)\b",
+    "travel": r"\b(?:travel|travelling|traveling)\b",
+    "walking": r"\b(?:walking|everyday walks?)\b",
+    "cycling": r"\b(?:cycling|biking)\b",
+    "gaming": r"\b(?:gaming|gameplay)\b",
+}
+_BENEFIT_PATTERNS = {
+    "cushioning": r"\b(?:cushioning|cushioned)\b",
+    "wide fit": r"\b(?:wide[- ]fit|wide fit|wider fit)\b",
+    "trail grip": r"\b(?:trail grip|grip|traction)\b",
+    "water resistance": r"\b(?:water[- ]resistant|water resistance|waterproof)\b",
+    "ankle support": r"\bankle support\b",
+    "professional styling": r"\b(?:professional styl(?:e|ing)|professional design)\b",
+    "laptop compartment": r"\b(?:laptop compartment|laptop sleeve)\b",
+    "durability": r"\b(?:durable|durability|long-lasting)\b",
+    "lightweight": r"\blightweight\b",
+    "compatibility": r"\b(?:compatible|compatibility)\b",
+}
+_MATERIAL_PATTERN = re.compile(
+    r"\b(?:recycled (?:rubber|plastic|polyester|material|materials|sole)|leather|canvas|cotton|"
+    r"polyester|nylon|rubber|wool|wood|steel|aluminium|aluminum|carbon fiber)\b", re.I)
+_SUSTAINABILITY_PATTERN = re.compile(
+    r"\b(?:recycled|low[- ]impact|sustainab(?:le|ility)|organic|fair[ -]trade|"
+    r"FSC[- ]certified|certified organic)\b", re.I)
+_AVAILABILITY_PATTERN = re.compile(
+    r"\b(?:in stock|out of stock|sold out|currently unavailable|available now|available)\b", re.I)
+_SPEC_PATTERN = re.compile(
+    r"\b(?:\d+(?:[.,]\d+)?\s*(?:mm|cm|m|inches?|inch|kg|g|lb|oz|litres?|liters?|L|"
+    r"GB|TB|MHz|GHz|W|hours?)|\d{1,2}[- ]inch|dimensions?|capacity|weight|size|"
+    r"compatibility|processor|memory|storage)\b", re.I)
+_DIMENSION_PATTERN = re.compile(
+    r"\b(?:dimensions?|\d+(?:[.,]\d+)?\s*(?:mm|cm|m|inches?|inch|kg|g|lb|oz|litres?|liters?|L))\b",
+    re.I)
+_GENERIC_HEADINGS = {
+    "product", "products", "item", "details", "catalog", "catalogue", "collection",
+    "shop", "welcome", "home", "our products", "featured product", "new arrival",
+}
+
+
+def _normalized_observation(value: Any) -> str:
+    """Normalize extracted evidence through SignalTrace's shared scope primitive."""
+    normalized = normalize_scope({
+        "entity": "observed page", "predicate": "product evidence", "value": value,
+    })
+    return str(normalized["value"] or "")
+
+
+def product_service_evidence(page: PageParser, url: str) -> list[dict[str, Any]]:
+    """Extract bounded product/service facts with exact cached provenance."""
+    facts: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add(field: str, location: str, exact: Any, normalized: Any | None = None,
+            confidence: str = "certain") -> None:
+        raw = compact(str(exact))
+        if not raw:
+            return
+        value = _normalized_observation(raw if normalized is None else normalized)
+        key = (field, location, value)
+        if not value or key in seen:
+            return
+        seen.add(key)
+        facts.append({
+            "url": url,
+            "field": field,
+            "source_location": location,
+            "exact_observed_text": raw,
+            "normalized_value": value,
+            "confidence": confidence,
+        })
+
+    if page.title:
+        add("page_title", "title", page.title)
+    h1_values = [heading["text"] for heading in page.headings
+                 if heading["level"] == "h1" and heading["text"]]
+    for heading in page.headings:
+        field = "main_heading" if heading["level"] == "h1" else "subheading"
+        add(field, heading["level"], heading["text"])
+    visible_name = h1_values[0] if h1_values else page.title
+    if visible_name and _normalized_observation(visible_name) not in _GENERIC_HEADINGS:
+        add("product_or_service_name", "h1" if h1_values else "title", visible_name,
+            confidence="likely")
+    for key in ("description", "og:description", "twitter:description"):
+        if page.meta.get(key):
+            add("product_description", f"meta {key}", page.meta[key])
+    for index, element in enumerate(page.text_elements[:80], 1):
+        if element["tag"] == "p":
+            add("product_description", f"p[{index}]", element["text"], confidence="likely")
+
+    site_origin = urllib.parse.urlsplit(url).netloc.casefold()
+    for index, link in enumerate(page.links[:120], 1):
+        label = compact(link.get("text", ""))
+        if not label:
+            continue
+        if urllib.parse.urlsplit(link.get("url", "")).netloc.casefold() == site_origin:
+            add("internal_link", f"a[{index}]", label)
+        if classify_link(link) == "navigation" and (
+                "/category/" in urllib.parse.urlsplit(link.get("url", "")).path.casefold()
+                or re.search(r"\b(?:shoes?|bags?|laptops?|books?|services?|products?|running|trail|hiking)\b",
+                             label, re.I)):
+            add("category_label", f"a[{index}]", label)
+    for index, control in enumerate(page.controls[:50], 1):
+        label = compact(control.get("text") or control.get("aria_label") or control.get("label") or "")
+        if label and re.search(
+                r"\b(?:buy|shop|view|learn|contact|book|add|compare|browse|continue|start)\b", label, re.I):
+            add("call_to_action", f"{control.get('tag', 'control')}[{index}]", label)
+
+    sources = [(item["source_location"], item["exact_observed_text"])
+               for item in list(facts)]
+    for location, exact in sources:
+        price_matches = list(_PRICE_RE.finditer(exact))
+        for match in price_matches:
+            price = _prices(match.group(0))[0]
+            add("price", location, match.group(0), f"{price['value']} {price['unit']}")
+        if len(price_matches) >= 2 and re.search(
+                r"(?:-|–|—|\bto\b)", exact[price_matches[0].end():price_matches[1].start()], re.I):
+            add("price_range", location,
+                exact[price_matches[0].start():price_matches[1].end()])
+        match = _AVAILABILITY_PATTERN.search(exact)
+        if match:
+            add("availability", location, match.group(0))
+        for name, expression in _ACTIVITY_PATTERNS.items():
+            match = re.search(expression, exact, re.I)
+            if match:
+                add("activity_or_use_case", location, match.group(0), name)
+        for name, expression in _BENEFIT_PATTERNS.items():
+            match = re.search(expression, exact, re.I)
+            if match:
+                add("explicit_benefit", location, match.group(0), name)
+        material = _MATERIAL_PATTERN.search(exact)
+        if material:
+            add("material", location, material.group(0))
+        sustainable = _SUSTAINABILITY_PATTERN.search(exact)
+        if sustainable:
+            add("sustainability_or_certification", location, sustainable.group(0))
+        if _SPEC_PATTERN.search(exact):
+            add("technical_specification", location, exact)
+        if _DIMENSION_PATTERN.search(exact):
+            add("dimensions", location, exact)
+        audience = re.search(
+            r"\bfor\s+((?:daily |everyday |professional |office |trail |recreational |budget[- ]conscious )?"
+            r"(?:runners?|hikers?|commuters?|students?|teams?|travellers?|travelers?|cyclists?|walkers?))\b",
+            exact, re.I)
+        if audience:
+            add("explicit_audience", location, audience.group(0), audience.group(1))
+        location_match = re.search(
+            r"\b(?:serving|available in|located in|based in)\s+[A-Z][A-Za-z .'-]{2,50}", exact)
+        if location_match:
+            add("location_or_service_context", location, location_match.group(0))
+        budget = re.search(
+            r"\b(?:under|below|less than|up to)\s*(?:[$€£₹]\s*\d[\d,]*(?:\.\d{1,2})?|"
+            r"(?:USD|EUR|GBP|INR)\s*\d[\d,]*(?:\.\d{1,2})?)", exact, re.I)
+        if budget:
+            add("price_or_value_tier", location, budget.group(0))
+
+    nodes, _ = parsed_jsonld_nodes(page)
+    for block, node in nodes:
+        node_types = _types(node)
+        if not node_types.intersection({"product", "service", "offer"}):
+            continue
+        prefix = f"JSON-LD block {block}"
+        for prop, field in (
+            ("name", "product_or_service_name"), ("category", "category"),
+            ("description", "product_description"), ("material", "material"),
+            ("availability", "availability"), ("price", "price"),
+            ("priceRange", "price_range"), ("audience", "explicit_audience"),
+        ):
+            value = node.get(prop)
+            if value not in (None, "", [], {}):
+                if isinstance(value, dict):
+                    value = value.get("name") or value.get("@id") or json.dumps(value, sort_keys=True)
+                add(field, f"{prefix} {prop}", value)
+        for prop in ("width", "height", "depth", "weight", "size", "sku", "mpn"):
+            if node.get(prop) not in (None, ""):
+                field = "dimensions" if prop in {"width", "height", "depth", "weight", "size"} \
+                    else "technical_specification"
+                add(field, f"{prefix} {prop}", node[prop])
+        offers = node.get("offers")
+        offer_values = offers if isinstance(offers, list) else [offers]
+        for offer_index, offer in enumerate(offer_values, 1):
+            if not isinstance(offer, dict):
+                continue
+            offer_location = f"{prefix} offers[{offer_index}]"
+            if offer.get("price") not in (None, ""):
+                exact_price = " ".join(filter(None, (
+                    str(offer.get("price")), str(offer.get("priceCurrency") or ""))))
+                add("price", f"{offer_location}.price", exact_price)
+            if offer.get("availability"):
+                add("availability", f"{offer_location}.availability", offer["availability"])
+
+    # Structured descriptions and categories are cached evidence too. Scan them
+    # after node extraction so they use the same controlled inference vocabulary.
+    structured_text = [item for item in list(facts)
+                       if item["source_location"].startswith("JSON-LD block")
+                       and item["field"] in {"product_description", "category",
+                                             "product_or_service_name", "material"}]
+    for item in structured_text:
+        exact, location = item["exact_observed_text"], item["source_location"]
+        for name, expression in _ACTIVITY_PATTERNS.items():
+            match = re.search(expression, exact, re.I)
+            if match:
+                add("activity_or_use_case", location, match.group(0), name)
+        for name, expression in _BENEFIT_PATTERNS.items():
+            match = re.search(expression, exact, re.I)
+            if match:
+                add("explicit_benefit", location, match.group(0), name)
+        sustainable = _SUSTAINABILITY_PATTERN.search(exact)
+        if sustainable:
+            add("sustainability_or_certification", location, sustainable.group(0))
+
+    return facts
+
+
+def _fact_values(facts: list[dict[str, Any]], *fields: str) -> str:
+    selected = [item["normalized_value"] for item in facts if item["field"] in fields]
+    return " ".join(selected)
+
+
+def _joined_phrases(values: list[str]) -> str:
+    if len(values) < 2:
+        return values[0] if values else ""
+    return ", ".join(values[:-1]) + " and " + values[-1]
+
+
+def _communication_has(concept: str, communication: str) -> bool:
+    expressions = {
+        "running": r"\brunn?(?:ing|er|ers)?\b",
+        "trail": r"\btrail\b",
+        "hiking": r"\bhik(?:e|ing|er|ers)\b",
+        "office commuting": r"\b(?:office|professional|work|commut)\w*\b",
+        "cushioning": r"\bcushion\w*\b",
+        "wide fit": r"\bwide[- ]fit\b|\bwider fit\b",
+        "trail grip": r"\b(?:grip|traction)\b",
+        "water resistance": r"\bwater[- ]?(?:resistan\w*|proof)\b",
+        "ankle support": r"\bankle support\b",
+        "professional styling": r"\bprofessional (?:styl\w*|design)\b",
+        "laptop compartment": r"\blaptop (?:compartment|sleeve)\b",
+        "durability": r"\bdurab\w*\b|\blong-lasting\b",
+        "lightweight": r"\blightweight\b",
+        "compatibility": r"\bcompatib\w*\b",
+    }
+    expression = expressions.get(concept, rf"\b{re.escape(concept)}\b")
+    return bool(re.search(expression, communication, re.I))
+
+
+def _candidate_positioning(facts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    searchable = _fact_values(
+        facts, "product_or_service_name", "category", "category_label", "product_description",
+        "activity_or_use_case", "explicit_benefit", "material", "technical_specification",
+        "sustainability_or_certification")
+    activities = {item["normalized_value"] for item in facts
+                  if item["field"] == "activity_or_use_case"}
+    benefits = set(item["normalized_value"] for item in facts if item["field"] == "explicit_benefit")
+    sustainability_label = next((item["normalized_value"] for item in facts
+                                 if item["field"] == "sustainability_or_certification"), "")
+    daily = bool(re.search(r"\b(?:daily|everyday)\b", searchable))
+    wide = "wide fit" in benefits
+    cushioning = "cushioning" in benefits
+    budget_fact = next((item["exact_observed_text"] for item in facts
+                        if item["field"] == "price_or_value_tier"), "")
+
+    result: dict[str, Any]
+    footwear = bool(re.search(r"\b(?:shoes?|footwear|trainers?|sneakers?|boots?)\b", searchable))
+    if ("running" in activities and footwear
+            and not activities.intersection({"hiking", "trail activity"})):
+        use_case = "daily recreational running" if daily else "recreational running"
+        needs = [item for item, present in (("cushioning", cushioning), ("a wide fit", wide)) if present]
+        audience = "Candidate audience: runners" + (" seeking " + _joined_phrases(needs) if needs else "")
+        headline = ("Daily " if daily else "") + "Running Shoes"
+        attributes = []
+        if cushioning:
+            attributes.append("Cushioning")
+        if wide:
+            attributes.append("a Wide Fit")
+        if attributes:
+            headline += " with " + _joined_phrases(attributes)
+        taglines = []
+        if cushioning or wide:
+            taglines.append(_joined_phrases(attributes) + (" for Daily Running" if daily else " for Running"))
+        else:
+            taglines.append("Shoes for " + ("Daily Running" if daily else "Running"))
+        categories = ["Wide-Fit Running Shoes" if wide else "Running Shoes"]
+        search = [" ".join(filter(None, (
+            "wide-fit" if wide else "", "cushioned" if cushioning else "",
+            "daily" if daily else "", "running shoes"))).strip()]
+        if sustainability_label:
+            search.append(f"running shoes with {sustainability_label}")
+        if budget_fact:
+            search.append(f"running shoes {budget_fact.casefold()}")
+        headlines = [headline]
+        if budget_fact:
+            headlines.append(("Daily " if daily else "") + f"Running Shoes {budget_fact}")
+        result = {"use_case": use_case, "audience": audience, "activity": "running",
+                  "headlines": headlines, "taglines": taglines,
+                  "category_labels": categories, "search_phrases": search}
+    elif activities.intersection({"hiking", "trail activity"}) and footwear:
+        if not benefits.intersection({"trail grip", "water resistance", "ankle support"}):
+            return None
+        primary_activity = "trail" if "trail activity" in activities else "hiking"
+        activity_label = "Trail" if primary_activity == "trail" else "Hiking"
+        labels = [label for label in ("Trail Grip" if "trail grip" in benefits else "",
+                                      "Water Resistance" if "water resistance" in benefits else "",
+                                      "Ankle Support" if "ankle support" in benefits else "") if label]
+        result = {
+            "use_case": "hiking or trail activity",
+            "audience": "Candidate audience: people seeking " + _joined_phrases([label.casefold() for label in labels])
+                        + " for hiking or trail activity",
+            "activity": primary_activity,
+            "headlines": [activity_label + " Footwear with " + _joined_phrases(labels)],
+            "taglines": [_joined_phrases(labels) + " for " + activity_label],
+            "category_labels": [activity_label + " Footwear"],
+            "search_phrases": [" ".join(label.casefold() for label in labels)
+                               + " " + activity_label.casefold() + " footwear"],
+        }
+    elif (re.search(r"\b(?:laptop bag|laptop backpack|notebook bag)\b", searchable)
+          and "office commuting" in activities and "laptop compartment" in benefits):
+        capacity = next((item["exact_observed_text"] for item in facts
+                         if item["field"] == "technical_specification"
+                         and re.search(r"\b\d{1,2}[- ]inch\b", item["exact_observed_text"], re.I)), "")
+        size = re.search(r"\b\d{1,2}[- ]inch\b", capacity, re.I)
+        size_label = size.group(0) if size else ""
+        result = {
+            "use_case": "office commuting with a laptop",
+            "audience": "Candidate audience: office commuters carrying a laptop",
+            "activity": "office commuting",
+            "headlines": [(size_label + " " if size_label else "") + "Laptop Bags for Office Commuting"],
+            "taglines": ["A Laptop Compartment for Office Commutes"],
+            "category_labels": ["Office-Commuter Laptop Bags"],
+            "search_phrases": [" ".join(filter(None, (size_label.casefold(), "laptop bag for office commuting")))],
+        }
+    elif "gaming" in activities and re.search(r"\b(?:laptop|computer|notebook)\b", searchable):
+        device = "Laptop" if re.search(r"\b(?:laptop|notebook)\b", searchable) else "Computer"
+        result = {
+            "use_case": "gaming",
+            "audience": f"Candidate audience: people seeking a {device.casefold()} for gaming",
+            "activity": "gaming",
+            "headlines": [f"{device} for Gaming"],
+            "taglines": [f"For Gaming on a {device}"],
+            "category_labels": [f"Gaming {device}s"],
+            "search_phrases": [f"{device.casefold()} for gaming"],
+        }
+    else:
+        return None
+    result["concepts"] = [result["activity"]] + sorted(benefits)
+    return result
+
+
+def _positioning_opportunity(*, rule_id: str, priority: str, category: str,
+                             action: str, reason: str, url: str, source: str,
+                             observed: list[dict[str, Any]], candidate: dict[str, Any],
+                             confidence: str = "likely") -> dict[str, Any]:
+    return {
+        "id": rule_id, "priority": priority, "category": category,
+        "action": action, "reason": reason,
+        "evidence": {"url": url, "source": source, "observed": observed},
+        "candidate_use_case": candidate["use_case"],
+        "candidate_audience": candidate["audience"],
+        "suggested_headlines": list(dict.fromkeys(candidate["headlines"])),
+        "suggested_taglines": list(dict.fromkeys(candidate["taglines"])),
+        "suggested_category_labels": list(dict.fromkeys(candidate["category_labels"])),
+        "suggested_search_phrases": list(dict.fromkeys(candidate["search_phrases"])),
+        "confidence": confidence, "is_finding": False,
+    }
+
+
+def positioning_opportunity_audit(page: PageParser, url: str,
+                                  evidence_source: str = "initial HTML") -> list[dict[str, Any]]:
+    """Find communication gaps without treating a missing tagline as a defect."""
+    facts = product_service_evidence(page, url)
+    candidate = _candidate_positioning(facts)
+    if candidate is None:
+        return []
+    communication_facts = [item for item in facts if item["field"] in {
+        "page_title", "main_heading", "subheading", "category", "category_label"}]
+    communication = " ".join(item["normalized_value"] for item in communication_facts)
+    main_heading = next((item["normalized_value"] for item in facts
+                         if item["field"] == "main_heading"), "")
+    generic_heading = not main_heading or main_heading in _GENERIC_HEADINGS
+    missing_concepts = [concept for concept in candidate["concepts"]
+                        if concept and not _communication_has(concept, communication)]
+    prominent_fields = {"page_title", "main_heading", "subheading", "category", "category_label",
+                        "product_or_service_name"}
+
+    def evidence_for(*specific_fields: str) -> list[dict[str, Any]]:
+        wanted = prominent_fields | set(specific_fields)
+        selected = [item for item in facts if item["field"] in wanted]
+        # Put the gap-specific facts first so an evidence cap cannot hide the
+        # observation that supports the recommendation.
+        selected.sort(key=lambda item: (item["field"] in prominent_fields,
+                                        item["source_location"], item["field"]))
+        return selected[:20]
+
+    items: list[dict[str, Any]] = []
+
+    if generic_heading or not _communication_has(candidate["activity"], communication):
+        items.append(_positioning_opportunity(
+            rule_id="opportunity-positioning-use-case", priority="high", category="positioning",
+            action="Test a primary heading that states the observed product use case and supported attributes.",
+            reason="Specific use-case evidence is present, but the primary communication does not state it clearly.",
+            url=url, source=evidence_source,
+            observed=evidence_for("activity_or_use_case", "explicit_benefit", "explicit_audience"),
+            candidate=candidate))
+    if len(missing_concepts) >= 2:
+        items.append(_positioning_opportunity(
+            rule_id="opportunity-positioning-search-language", priority="medium",
+            category="discoverability",
+            action="Test observed use-case and attribute terms in the title, headings, or category labels.",
+            reason="Multiple search-relevant terms in cached body evidence are absent from prominent page labels.",
+            url=url, source=evidence_source,
+            observed=evidence_for("activity_or_use_case", "explicit_benefit"), candidate=candidate))
+    benefits = [item for item in facts if item["field"] == "explicit_benefit"]
+    communicated_benefits = [item for item in benefits
+                             if _communication_has(item["normalized_value"], communication)]
+    if len(benefits) >= 2 and len(communicated_benefits) < 2:
+        items.append(_positioning_opportunity(
+            rule_id="opportunity-positioning-attribute-summary", priority="medium",
+            category="content-clarity",
+            action="Group the observed functional attributes into one concise visitor-readable value proposition.",
+            reason="Multiple supported attributes are present but are not summarized together in prominent communication.",
+            url=url, source=evidence_source,
+            observed=evidence_for("explicit_benefit", "technical_specification", "dimensions"),
+            candidate=candidate))
+    sustainable = [item for item in facts if item["field"] == "sustainability_or_certification"]
+    if sustainable and not any(_communication_has(item["normalized_value"], communication)
+                               for item in sustainable):
+        items.append(_positioning_opportunity(
+            rule_id="opportunity-positioning-sustainability", priority="low",
+            category="positioning",
+            action="Test the observed material or sustainability wording in a concise product summary.",
+            reason="A sustainability-related attribute is present in cached evidence but absent from prominent labels.",
+            url=url, source=evidence_source,
+            observed=evidence_for("sustainability_or_certification", "material", "explicit_benefit"),
+            candidate=candidate))
+    value_tier = [item for item in facts if item["field"] == "price_or_value_tier"]
+    if value_tier and not any(item["normalized_value"] in communication for item in value_tier):
+        items.append(_positioning_opportunity(
+            rule_id="opportunity-positioning-value-tier", priority="low", category="positioning",
+            action="Test the exact observed price-tier language alongside the supported use case.",
+            reason="The page states a price threshold, but prominent communication does not connect it to the product use case.",
+            url=url, source=evidence_source,
+            observed=evidence_for("price_or_value_tier", "price", "activity_or_use_case"),
+            candidate=candidate))
+    activities = {item["normalized_value"] for item in facts if item["field"] == "activity_or_use_case"}
+    activity_groups = {"trail/hiking" if item in {"trail activity", "hiking"} else item
+                       for item in activities}
+    if len(activity_groups) >= 2 and sum(_communication_has(activity, communication)
+                                         for activity in activities) < len(activities):
+        items.append(_positioning_opportunity(
+            rule_id="opportunity-positioning-multiple-use-cases", priority="low",
+            category="content-clarity",
+            action="Distinguish the separately observed use cases in headings or category labels.",
+            reason="Cached evidence supports multiple activities, but prominent communication does not distinguish them.",
+            url=url, source=evidence_source,
+            observed=evidence_for("activity_or_use_case", "explicit_benefit"), candidate=candidate))
+    return deduplicate_opportunities(items)
+
+
 def improvement_opportunity_audit(page: PageParser, url: str,
                                   evidence_source: str = "initial HTML") -> list[dict[str, Any]]:
     """Emit conservative opportunities using only the cached initial representation."""
@@ -525,6 +989,7 @@ def improvement_opportunity_audit(page: PageParser, url: str,
             observed=compact(text[max(0, attribute_prose.start() - 60):attribute_prose.end() + 100]),
             confidence="likely"))
 
+    items.extend(positioning_opportunity_audit(page, url, evidence_source))
     return deduplicate_opportunities(items)
 
 
@@ -760,6 +1225,39 @@ def visitor_journey_audit(target_page: PageParser, target_url: str,
                 observed="No supported continuation label or enabled action observed", confidence="certain"))
 
         link = item.get("link") or {}
+        listing_text = compact(" ".join((link.get("text", ""), link.get("context", ""))), 1600)
+        listing_activities = {
+            name for name, expression in _ACTIVITY_PATTERNS.items()
+            if re.search(expression, listing_text, re.I)
+        }
+        detail_facts = product_service_evidence(page, item["url"])
+        detail_activities = {
+            fact["normalized_value"] for fact in detail_facts
+            if fact["field"] == "activity_or_use_case"
+        }
+        listing_groups = {"trail/hiking" if value in {"trail activity", "hiking"} else value
+                          for value in listing_activities}
+        detail_groups = {"trail/hiking" if value in {"trail activity", "hiking"} else value
+                         for value in detail_activities}
+        detail_candidate = _candidate_positioning(detail_facts)
+        if (listing_groups and detail_groups and listing_groups.isdisjoint(detail_groups)
+                and detail_candidate is not None):
+            observations = [{
+                "url": target_url, "field": "listing_activity_or_use_case",
+                "source_location": "listing link text/context",
+                "exact_observed_text": listing_text,
+                "normalized_value": ", ".join(sorted(listing_activities)),
+                "confidence": "certain",
+            }] + [fact for fact in detail_facts if fact["field"] in {
+                "page_title", "main_heading", "category", "category_label",
+                "activity_or_use_case", "explicit_benefit"}][:12]
+            opportunities.append(_positioning_opportunity(
+                rule_id="opportunity-positioning-listing-detail-terminology",
+                priority="high", category="content-clarity",
+                action="Align the listing and detail terminology around the same observed product activity.",
+                reason="The cached listing and detail representations use different explicit activity terms for this route.",
+                url=item["url"], source="sampled internal page", observed=observations,
+                candidate=detail_candidate, confidence="certain"))
         listing_prices = _prices(link.get("context", ""))
         detail_prices = _prices(page.visible_text)
         label = compact(link.get("text", "") or link.get("title", ""))
