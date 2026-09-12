@@ -21,7 +21,9 @@ def compact(value: str, limit: int = 280) -> str:
 
 _TRACKING_PARAMETER_NAMES = {
     "gclid", "gad_source", "gad_campaignid", "gbraid", "clickid", "fbclid",
-    "dclid", "msclkid", "twclid", "mc_cid", "mc_eid",
+    "dclid", "msclkid", "twclid", "mc_cid", "mc_eid", "campaign_id",
+    "deep_link_value", "is_retargeting", "pid", "c", "host_internal",
+    "product_name", "storecontext",
 }
 
 
@@ -86,11 +88,11 @@ def opportunity(*, rule_id: str, priority: str, category: str, action: str,
         "category": category,
         "action": action,
         "reason": reason,
-        "evidence": {
+        "evidence": _canonicalize_url_fields({
             "url": canonicalize_url(url),
             "source": source,
             "observed": compact(observed) if isinstance(observed, str) else observed,
-        },
+        }),
         "confidence": confidence,
         "is_finding": False,
     }
@@ -1668,7 +1670,6 @@ def _identity_candidates(page: PageParser) -> list[dict[str, str]]:
         ("twitter:title", page.meta.get("twitter:title", "")),
         ("title", page.title),
         ("profile:username", page.meta.get("profile:username", "")),
-        ("og:site_name", page.meta.get("og:site_name", "")),
     )
     seen: set[str] = set()
     for source, value in values:
@@ -1824,8 +1825,7 @@ def same_as_destination_observation(declaration: dict[str, Any], source_url: str
     generic = re.compile(
         r"^(?:facebook|instagram|linkedin|twitter|x|youtube|tiktok|wikipedia|crunchbase|"
         r"home|log ?in|sign ?in|page not found)(?:\W.*)?$", re.I)
-    positive = [item for item in candidates
-                if item["source"] != "og:site_name" and not generic.match(item["value"].strip())]
+    positive = [item for item in candidates if not generic.match(item["value"].strip())]
     if brand and positive:
         result["identity_verdict"] = "conflicting"
         findings.append(finding(

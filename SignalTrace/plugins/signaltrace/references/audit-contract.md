@@ -12,6 +12,17 @@ The visitor-journey sample is selected only from the cached target page. Prefer 
 
 The small sample is deliberate, not an instruction to consume the available request or time ceiling. One page per role provides bounded role diversity while limiting load, repeated-template evidence, and exposure to slow origins; unused budget remains a safety margin for robots requests, redirects, explicitly supplied citations or sources, and `sameAs` verification. The default deadline in this package is 30 seconds and the enforced hard ceiling is 300 seconds. This checkout does not implement a 225-second scheduling freeze or a 280-second report target. Expanding toward either threshold would be a separate coverage-policy decision and must retain the same non-recursive selection, spacing, serialization, and governor limits.
 
+For `sameAs` identity comparison, `og:site_name` is platform-level metadata and is excluded from destination identity candidates and verdict comparisons. It is not evidence about the account or channel owner. Entity-level signals such as `og:title`, `title`, `twitter:title`, `profile:username`, headings, and destination JSON-LD names remain eligible; a destination with no eligible signal is `insufficient-evidence`.
+
+### Observed timings
+
+Captured 2026-09-12 during bounded real-site audits:
+
+- Mokobara collection page: approximately 10.7 seconds elapsed, 6 total requests, and 5 target-page requests.
+- Myntra homepage deep link: approximately 15.2 seconds elapsed, 14 total requests, and 8 target requests.
+
+Both runs completed well under the package's 30-second default deadline and 300-second hard ceiling. These observations cover only two small, bounded audits; neither exercised a large enough site or link-sampling volume to validate the ceiling, the sampling policy at scale, or worst-case timing behavior. They are timing observations, not a basis for changing timeout, deadline, request, or sampling constants.
+
 ## Optional delegation contract
 
 Delegation is an optimization, never a dependency. When no subagent facility exists, run every specialist locally against the same cached evidence. If delegation exists, create a specialist only for a concrete missing evidence dependency: one selected final destination, one named external source, one linked policy page, or one alternate representation. A finding by itself is not a reason to delegate, and ordinary analysis always uses the cache.

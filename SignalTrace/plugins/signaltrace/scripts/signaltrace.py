@@ -17,6 +17,7 @@ from analyzers import (
     classify_link, deduplicate_opportunities, destination_observation, finding,
     improvement_opportunity_audit, opportunity, parse_page, source_verification, structured_data_audit,
     same_as_declarations, same_as_destination_observation, visitor_journey_audit,
+    _canonicalize_url_fields,
 )
 from runtime import Evidence, LimitError, RequestGovernor, UnsafeTarget
 from config import DEFAULTS
@@ -653,6 +654,8 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
     _enforce_evidence_bounded_language(opportunities)
     findings = deduplicate_findings(findings)
     opportunities = deduplicate_opportunities(opportunities)
+    findings = _canonicalize_url_fields(findings)
+    opportunities = _canonicalize_url_fields(opportunities)
     counts = {name: sum(1 for item in findings if item["severity"] == name)
               for name in ("Critical", "High", "Medium")}
     snapshot = governor.snapshot()

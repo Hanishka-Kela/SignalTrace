@@ -171,7 +171,8 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(result["identity_verdict"], "conflicting")
 
     def test_tracking_parameters_are_removed_from_finding_urls(self):
-        requested = "https://example.com/item?sku=42&utm_source=test&gclid=abc&af_dp=app"
+        requested = ("https://example.com/item?sku=42&utm_source=test&gclid=abc&af_dp=app&"
+                 "campaign_id=123&deep_link_value=app%3A%2F%2Fitem&pid=affiliate")
         self.assertEqual(canonicalize_url(requested), "https://example.com/item?sku=42")
         item = finding(code="fixture", title="Fixture", severity="Medium", confidence=1,
                        evidence={"requested_url": requested}, affected_url=requested,
@@ -179,6 +180,12 @@ class AnalyzerTests(unittest.TestCase):
                        suggested_action="Review.", priority=1)
         self.assertEqual(item["affected_url"], "https://example.com/item?sku=42")
         self.assertEqual(item["evidence"]["requested_url"], "https://example.com/item?sku=42")
+        suggestion = opportunity(
+            rule_id="fixture-opportunity", priority="low", category="engagement",
+            action="Review.", reason="Observed.", url=requested, source="initial HTML",
+            observed={"url": requested}, confidence="likely")
+        self.assertEqual(suggestion["evidence"]["observed"]["url"],
+                         "https://example.com/item?sku=42")
 
     def test_graph_wrapped_organization_same_as_is_extracted(self):
         page = parse_page(
@@ -247,6 +254,26 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(result["identity_verdict"], "plausible match")
         self.assertTrue(any(item["result"] == "compatible"
                             for item in result["scope_comparisons"]))
+
+    def test_youtube_platform_site_name_is_excluded_from_same_as_comparison(self):
+        declaration = {"url": "https://www.youtube.com/@myntra", "brand": "Myntra",
+                       "node_type": "Organization", "block": 1}
+        destination = parse_page(
+            '<html><head><title>Myntra - YouTube</title>'
+            '<meta property="og:title" content="Myntra">'
+            '<meta property="og:site_name" content="YouTube"></head></html>',
+            declaration["url"])
+        evidence = Evidence(declaration["url"], declaration["url"], 200,
+                            {"content-type": "text/html"}, b"", [], "ok")
+        _, _, result = same_as_destination_observation(
+            declaration, "https://myntra.example/", evidence, destination)
+        self.assertEqual({item["source"] for item in result["destination_identity"]},
+                         {"og:title", "title"})
+        self.assertEqual({item["source"] for item in result["scope_comparisons"]},
+                         {"og:title", "title"})
+        self.assertIn({"source": "og:title", "result": "compatible"},
+                  result["scope_comparisons"])
+        self.assertEqual(result["identity_verdict"], "plausible match")
 
     def test_dead_same_as_is_a_high_identity_finding(self):
         declaration = {"url": "https://social.example/missing", "brand": "Acme",
