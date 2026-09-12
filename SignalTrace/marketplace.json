@@ -4,32 +4,32 @@
   "skills": [
     {
       "id": "audit-entrypoint",
-      "path": "plugins/signaltrace/skills/audit-entrypoint",
+      "path": "skills/audit-entrypoint",
       "entrypoint": true
     },
     {
       "id": "structured-data-audit",
-      "path": "plugins/signaltrace/skills/structured-data-audit",
+      "path": "skills/structured-data-audit",
       "entrypoint": false
     },
     {
       "id": "content-engagement-audit",
-      "path": "plugins/signaltrace/skills/content-engagement-audit",
+      "path": "skills/content-engagement-audit",
       "entrypoint": false
     },
     {
       "id": "citation-destination-audit",
-      "path": "plugins/signaltrace/skills/citation-destination-audit",
+      "path": "skills/citation-destination-audit",
       "entrypoint": false
     },
     {
       "id": "source-verification-audit",
-      "path": "plugins/signaltrace/skills/source-verification-audit",
+      "path": "skills/source-verification-audit",
       "entrypoint": false
     },
     {
       "id": "improvement-opportunity-audit",
-      "path": "plugins/signaltrace/skills/improvement-opportunity-audit",
+      "path": "skills/improvement-opportunity-audit",
       "entrypoint": false
     }
   ]

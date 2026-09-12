@@ -166,6 +166,19 @@ class AnalyzerTests(unittest.TestCase):
         ids = {item["id"] for item in improvement_opportunity_audit(page, page.base_url)}
         self.assertNotIn("opportunity-structured-review-signals", ids)
 
+    def test_product_with_exactly_one_review_signal_suppresses_opportunity(self):
+        """Plain Product: exactly one of aggregateRating/review present must NOT fire (OR suppression)."""
+        rating_only = parse_page(
+            '<script type="application/ld+json">'
+            '{"@type":"Product","name":"Widget","aggregateRating":{}}</script>',
+            "https://example.com/")
+        review_only = parse_page(
+            '<script type="application/ld+json">'
+            '{"@type":"Product","name":"Widget","review":{}}</script>',
+            "https://example.com/")
+        for page in (rating_only, review_only):
+            ids = {item["id"] for item in improvement_opportunity_audit(page, page.base_url)}
+            self.assertNotIn("opportunity-structured-review-signals", ids)
 
     def test_visible_questions_without_faq_schema_get_proactive_opportunity(self):
         page = parse_page("<h2>What is Widget?</h2><p>Widget is useful.</p>"
@@ -1537,8 +1550,7 @@ class RuntimeTests(unittest.TestCase):
 
 class PackageTests(unittest.TestCase):
     def test_contest_manifest_has_six_skills_one_entrypoint_and_valid_paths(self):
-        plugin = pathlib.Path(__file__).resolve().parents[1]
-        root = plugin.parents[1]
+        root = pathlib.Path(__file__).resolve().parents[1]
         marketplace = json.loads((root / "marketplace.json").read_text())
         self.assertNotIn("plugins", marketplace)
         self.assertEqual(len(marketplace["skills"]), 6)
@@ -1549,8 +1561,7 @@ class PackageTests(unittest.TestCase):
             self.assertTrue((root / item["path"] / "SKILL.md").is_file(), item["path"])
 
     def test_all_declared_skills_have_mit_frontmatter(self):
-        plugin = pathlib.Path(__file__).resolve().parents[1]
-        root = plugin.parents[1]
+        root = pathlib.Path(__file__).resolve().parents[1]
         marketplace = json.loads((root / "marketplace.json").read_text())
         for item in marketplace["skills"]:
             text = (root / item["path"] / "SKILL.md").read_text()

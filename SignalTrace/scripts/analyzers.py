@@ -1043,8 +1043,9 @@ def improvement_opportunity_audit(page: PageParser, url: str,
     # yield inner Product nodes to every consumer of parsed_nodes (schema-minimum, sameAs,
     # etc.) and is a broader change than this detection gap. Special-casing ProductGroup
     # here is sufficient: AggregateRating/Review on the group node are the review signals
-    # this rule cares about, and either property is enough to suppress (schema.org and the
-    # rule action are OR, not AND).
+    # this rule cares about. Intended suppression for Product, Service, and ProductGroup
+    # alike: fire only when both aggregateRating and review are absent (len(missing) == 2).
+    # Either property is enough to suppress — the rule action is OR, not AND.
     product_or_service_nodes = [node for _, node in parsed_nodes
                                 if _types(node).intersection({"product", "productgroup", "service"})]
     for node in product_or_service_nodes:
