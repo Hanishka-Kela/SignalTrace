@@ -339,6 +339,14 @@ def _select_journey_links(page, target_url: str, limit: int) -> tuple[list[dict[
     return selected, skipped[:DEFAULTS.skipped_link_evidence_maximum]
 
 
+def _journey_coverage_note(journey_links: list[dict[str, str]]) -> str | None:
+    if journey_links:
+        return None
+    return (
+        "visitor-journey: no internal links were available in the initial HTML to sample; "
+        "journey coverage is limited to the target page itself.")
+
+
 def _journey_sample_limit(robots_result: dict[str, str], requested_limit: int) -> int:
     """Reduce, never expand, the sample when no usable robots policy was fetched."""
     requested_limit = max(0, requested_limit)
@@ -589,6 +597,9 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     citations = _explicit_citations(payload, target_url)[:max(0, args.max_link_checks)]
     journey_limit = _journey_sample_limit(robots_result, args.max_link_checks)
     journey_links, skipped_links = _select_journey_links(page, target_url, journey_limit)
+    journey_note = _journey_coverage_note(journey_links)
+    if journey_note:
+        unresolved.append(journey_note)
     journey_coverage["selected_links"] = [
         {"url": item["url"], "role": item.get("role", "other"),
          "label": item.get("text", "")} for item in journey_links]

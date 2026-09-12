@@ -28,7 +28,7 @@ from config import DEFAULTS, USER_AGENT
 from scope import compare_scopes, normalize_scope
 from signaltrace import (
     _audit_same_as, _consolidate_opportunities, _journey_sample_limit, _report,
-    _select_journey_links, _source_verification_state,
+    _journey_coverage_note, _select_journey_links, _source_verification_state,
 )
 
 
@@ -63,6 +63,20 @@ class AnalyzerTests(unittest.TestCase):
             self.assertIsInstance(action, dict)
             self.assertTrue(action["summary"])
             self.assertIn(action["priority"], {"critical", "high", "medium", "low"})
+
+    def test_finding_id_ignores_volatile_script_character_count(self):
+        common = dict(code="initial-html-answer-empty", title="Thin HTML",
+                      severity="Medium", confidence=.9,
+                      affected_url="https://example.com/", evidence_type="initial-html",
+                      responsible_party="site-published link", impact="Thin.",
+                      suggested_action="Add readable content.", priority=75)
+        first = finding(evidence={"readable_word_count": 6, "script_characters": 139578,
+                                  "title": "Example"}, **common)
+        second = finding(evidence={"readable_word_count": 6, "script_characters": 139580,
+                                   "title": "Example"}, **common)
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(first["evidence"]["script_characters"], 139578)
+        self.assertEqual(second["evidence"]["script_characters"], 139580)
 
     def test_bare_url_source_verification_is_not_executed(self):
         status, note = _source_verification_state({"site": "https://example.com/"})
@@ -862,6 +876,27 @@ class VisitorJourneyTests(unittest.TestCase):
         evidence = Evidence(link["url"], link["url"], 404, {}, b"", [], "http-error")
         findings, _ = destination_observation(link, landing.base_url, evidence, None)
         self.assertEqual(findings[0]["severity"], "high")
+
+    def test_empty_journey_selection_is_reported_as_limited_coverage(self):
+        page = parse_page("<h1>Standalone page</h1><p>Readable content.</p>",
+                          "https://shop.example/")
+        selected, skipped = _select_journey_links(page, page.base_url, 5)
+        self.assertEqual(selected, [])
+        self.assertEqual(skipped, [])
+        note = _journey_coverage_note(selected)
+        self.assertIsNotNone(note)
+        report = _report(page.base_url, RequestGovernor(spacing_seconds=0), [],
+                 ["visitor-journey"], [note], [],
+                         {"selected_links": [], "crawled_links": [], "skipped_links": []})
+        self.assertIn(note, report["coverage"]["checks_unresolved"])
+        self.assertEqual(report["coverage"]["journey"]["selected_links"], [])
+        self.assertEqual(report["coverage"]["journey"]["crawled_links"], [])
+
+    def test_internal_journey_links_do_not_trigger_empty_coverage_note(self):
+        page = parse_page("<a href='/products/widget'>Widget</a>", "https://shop.example/")
+        selected, _ = _select_journey_links(page, page.base_url, 5)
+        self.assertTrue(selected)
+        self.assertIsNone(_journey_coverage_note(selected))
 
     def test_auth_gated_journey_links_are_excluded_from_role_sampling(self):
         landing = parse_page(

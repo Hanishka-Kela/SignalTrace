@@ -60,6 +60,16 @@ def _canonicalize_url_fields(value: Any) -> Any:
     return value
 
 
+def _finding_identity_evidence(value: Any) -> Any:
+    """Remove volatile diagnostic-only fields from stable finding identity."""
+    if isinstance(value, dict):
+        return {key: _finding_identity_evidence(item)
+                for key, item in value.items() if key != "script_characters"}
+    if isinstance(value, list):
+        return [_finding_identity_evidence(item) for item in value]
+    return value
+
+
 def _is_tracking_image(image: dict[str, str]) -> bool:
     src = str(image.get("src") or "")
     parts = urllib.parse.urlsplit(src)
@@ -88,7 +98,8 @@ def finding(*, code: str, title: str, severity: str, confidence: float,
     severity = severity.casefold()
     if severity not in {"critical", "high", "medium"}:
         raise ValueError(f"unsupported finding severity: {severity}")
-    stable = "|".join((code, affected_url, json.dumps(evidence, sort_keys=True)))
+    stable = "|".join((code, affected_url, json.dumps(
+        _finding_identity_evidence(evidence), sort_keys=True)))
     action_priority = ("critical" if priority >= 95 else
                        "high" if priority >= 80 else
                        "medium" if priority >= 60 else "low")
