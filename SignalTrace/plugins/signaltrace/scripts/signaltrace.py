@@ -13,8 +13,9 @@ from typing import Any
 
 from analyzers import (
     bot_directives_audit, content_engagement_audit, deduplicate_findings,
-    deduplicate_opportunities, destination_observation, finding,
+    classify_link, deduplicate_opportunities, destination_observation, finding,
     improvement_opportunity_audit, parse_page, source_verification, structured_data_audit,
+    visitor_journey_audit,
 )
 from runtime import Evidence, LimitError, RequestGovernor, UnsafeTarget
 from config import DEFAULTS
@@ -22,7 +23,7 @@ from config import DEFAULTS
 CHECKS = [
     "robots-policy", "target-fetch", "bot-directives", "structured-data",
     "content-engagement", "citation-destination", "source-verification",
-    "improvement-opportunities",
+    "visitor-journey", "improvement-opportunities",
 ]
 
 
@@ -73,25 +74,83 @@ def _is_html(evidence: Evidence) -> bool:
     return bool(evidence.body) and (media_type in {"", "text/html", "application/xhtml+xml"})
 
 
-def _select_links(page, target_url: str, limit: int) -> list[dict[str, str]]:
+def _select_journey_links(page, target_url: str, limit: int) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Choose at most one same-origin target-page link per journey role."""
     origin = urllib.parse.urlsplit(target_url).netloc.casefold()
-    preferred, fallback, seen = [], [], set()
+    target_without_fragment = urllib.parse.urldefrag(target_url)[0]
+    candidates: dict[str, list[dict[str, str]]] = {
+        role: [] for role in ("navigation", "detail", "search", "support", "policy", "other")}
+    skipped: list[dict[str, str]] = []
+    seen: set[str] = set()
     for link in page.links:
         try:
             parts = urllib.parse.urlsplit(link["url"])
         except ValueError:
+            skipped.append({"url": link.get("url", ""), "reason": "invalid URL"})
             continue
-        if parts.scheme not in {"http", "https"} or link["url"] in seen:
+        if parts.scheme not in {"http", "https"}:
+            skipped.append({"url": link.get("url", ""), "reason": "unsupported scheme"})
             continue
-        seen.add(link["url"])
-        text = link.get("text", "").casefold()
+        url = urllib.parse.urldefrag(link["url"])[0]
+        if url == target_without_fragment:
+            skipped.append({"url": url, "reason": "same-page or target URL"})
+            continue
+        if url in seen:
+            skipped.append({"url": url, "reason": "duplicate URL"})
+            continue
+        seen.add(url)
+        if parts.netloc.casefold() != origin:
+            skipped.append({"url": url, "reason": "cross-origin link outside journey sample"})
+            continue
         candidate = dict(link)
+        candidate["url"] = url
         candidate["responsible_party"] = "site-published link"
-        if any(word in text for word in ("source", "citation", "details", "documentation", "product", "buy", "learn more")):
-            preferred.append(candidate)
-        elif parts.netloc.casefold() == origin and text and text not in {"home", "menu", "next", "previous"}:
-            fallback.append(candidate)
-    return (preferred + fallback)[:max(0, limit)]
+        role = classify_link(candidate)
+        target_path = urllib.parse.urlsplit(target_url).path.rstrip("/")
+        relative = parts.path[len(target_path):].strip("/") if parts.path.startswith(target_path + "/") else ""
+        if (role == "detail" and relative and "/" not in relative
+                and not any(token in parts.path.casefold() for token in ("/product/", "/item/", "/detail/"))):
+            role = "navigation"
+        candidate["role"] = role
+        candidates[role].append(candidate)
+
+    # A static GET form action is an inspectable search/action route too.
+    for form in page.forms:
+        action = urllib.parse.urldefrag(form.get("action", ""))[0]
+        parts = urllib.parse.urlsplit(action)
+        search_control = any(control.get("type") == "search" or
+                             control.get("name", "").casefold() in {"q", "query", "search"}
+                             for control in form.get("controls", []))
+        if form.get("method") == "get" and search_control and parts.netloc.casefold() == origin and action not in seen:
+            candidates["search"].append({
+                "url": action, "text": "Search form action", "rel": "", "section": "form",
+                "responsible_party": "site-published link", "role": "search",
+            })
+            seen.add(action)
+
+    selected: list[dict[str, str]] = []
+    target_path = urllib.parse.urlsplit(target_url).path.rstrip("/")
+    candidates["navigation"].sort(key=lambda item: (
+        0 if ("/category/" in urllib.parse.urlsplit(item["url"]).path.casefold() or
+              urllib.parse.urlsplit(item["url"]).path.startswith(target_path + "/")) else 1,
+        0 if item.get("section") in {"nav", "header"} else 1))
+    candidates["detail"].sort(key=lambda item: (
+        0 if any(token in urllib.parse.urlsplit(item["url"]).path.casefold()
+                 for token in ("/product/", "/item/", "/detail/")) else 1,))
+    for item in candidates["other"]:
+        skipped.append({"url": item["url"], "role": "other",
+                        "reason": "link does not match a bounded journey role"})
+    for role in ("navigation", "detail", "search", "support", "policy"):
+        if candidates[role] and len(selected) < max(0, limit):
+            selected.append(candidates[role][0])
+            for item in candidates[role][1:]:
+                skipped.append({"url": item["url"], "role": role,
+                                "reason": "role already represented in bounded sample"})
+        else:
+            for item in candidates[role]:
+                skipped.append({"url": item["url"], "role": role,
+                                "reason": "journey sample limit reached"})
+    return selected, skipped[:DEFAULTS.skipped_link_evidence_maximum]
 
 
 def _explicit_citations(payload: dict[str, Any], base: str) -> list[dict[str, str]]:
@@ -127,6 +186,41 @@ def _audit_destination(governor: RequestGovernor, source_url: str,
     for item in found:
         item["responsible_party"] = link.get("responsible_party", "unresolved")
     return found, unresolved
+
+
+def _fetch_journey(governor: RequestGovernor, source_url: str,
+                   link: dict[str, str]) -> dict[str, Any]:
+    """Fetch one entrypoint-selected route; never selects or follows child links."""
+    record: dict[str, Any] = {
+        "url": link["url"], "role": link.get("role", "other"), "link": link,
+        "page": None, "findings": [], "unresolved": [], "skipped": None,
+    }
+    try:
+        evidence = governor.fetch(link["url"])
+    except (LimitError, UnsafeTarget) as exc:
+        record["skipped"] = str(exc)
+        record["unresolved"].append(f"visitor-journey: {link['url']} not assessed: {exc}")
+        return record
+    record["evidence"] = evidence
+    if evidence.outcome == "robots-denied":
+        record["skipped"] = "robots.txt denied this link"
+        record["unresolved"].append(
+            f"visitor-journey: {link['url']} restricted by robots.txt; not fetched")
+        return record
+    if evidence.outcome == "body-limit":
+        record["unresolved"].append(
+            f"visitor-journey: {link['url']} exceeded the body limit; partial evidence only")
+    page = parse_page(evidence.text(), evidence.final_url) if _is_html(evidence) else None
+    record["page"] = page
+    record["url"] = evidence.final_url
+    found, notes = destination_observation(link, source_url, evidence, page)
+    for item in found:
+        item["responsible_party"] = "site-published link"
+    record["findings"].extend(found)
+    record["unresolved"].extend(notes)
+    if page is None and not record["skipped"]:
+        record["skipped"] = "no usable HTML representation"
+    return record
 
 
 def _fetch_source(governor: RequestGovernor, url: str):
@@ -170,6 +264,8 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     opportunities: list[dict[str, Any]] = []
     completed, unresolved = [], []
+    journey_coverage: dict[str, list[dict[str, Any]]] = {
+        "selected_links": [], "crawled_links": [], "skipped_links": []}
     try:
         site = governor.normalize_url(requested_site)
     except (UnsafeTarget, ValueError) as exc:
@@ -232,15 +328,21 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
 
     page = parse_page(target.text(), target.final_url)
     robots_result = governor.robots_result(target.final_url)
-    links = _explicit_citations(payload, target.final_url)
-    observed = _select_links(page, target.final_url, args.max_link_checks)
-    known_urls = {item["url"] for item in links}
-    links.extend(item for item in observed if item["url"] not in known_urls)
-    links = links[:max(0, args.max_link_checks)]
+    if robots_result.get("result") not in {"allowed", "missing"}:
+        unresolved.append(
+            f"robots-policy: {robots_result.get('result')}: {robots_result.get('detail')}; "
+            "only the governor's permitted bounded behavior can continue")
+    citations = _explicit_citations(payload, target.final_url)[:max(0, args.max_link_checks)]
+    journey_links, skipped_links = _select_journey_links(page, target.final_url, args.max_link_checks)
+    journey_coverage["selected_links"] = [
+        {"url": item["url"], "role": item.get("role", "other"),
+         "label": item.get("text", "")} for item in journey_links]
+    journey_coverage["skipped_links"].extend(skipped_links)
     sources = list(dict.fromkeys(str(item) for item in payload.get("sources", []) if isinstance(item, str)))
-    linked_urls = {item["url"] for item in links}
+    linked_urls = {item["url"] for item in citations + journey_links}
     sources = [item for item in sources if item not in linked_urls]
     source_pages = []
+    journey_pages: list[dict[str, Any]] = []
 
     # Local parsing begins in parallel with independent, bounded network evidence tasks.
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(args.max_concurrency, 10))) as pool:
@@ -250,7 +352,10 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             pool.submit(content_engagement_audit, page, target.final_url): "content-engagement",
         }
         opportunity_future = pool.submit(improvement_opportunity_audit, page, target.final_url)
-        destination_futures = [pool.submit(_audit_destination, governor, target.final_url, link) for link in links]
+        journey_futures = [pool.submit(_fetch_journey, governor, target.final_url, link)
+                           for link in journey_links]
+        destination_futures = [pool.submit(_audit_destination, governor, target.final_url, link)
+                               for link in citations if link["url"] not in {item["url"] for item in journey_links}]
         source_futures = [pool.submit(_fetch_source, governor, url) for url in sources]
         for future, name in local_futures.items():
             try:
@@ -266,6 +371,35 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             completed.append("improvement-opportunities")
         except Exception as exc:
             unresolved.append(f"improvement-opportunities: analyzer did not complete: {exc}")
+        for future in journey_futures:
+            try:
+                record = future.result(timeout=max(.01, governor.remaining_seconds()))
+                findings.extend(record["findings"])
+                unresolved.extend(record["unresolved"])
+                if record.get("skipped"):
+                    journey_coverage["skipped_links"].append({
+                        "url": record["link"]["url"], "role": record["role"],
+                        "reason": record["skipped"]})
+                else:
+                    evidence = record["evidence"]
+                    journey_coverage["crawled_links"].append({
+                        "url": record["link"]["url"], "role": record["role"],
+                        "final_url": evidence.final_url, "status": evidence.status,
+                        "outcome": evidence.outcome})
+                    journey_pages.append(record)
+            except Exception as exc:
+                unresolved.append(f"visitor-journey: check did not complete: {exc}")
+        try:
+            found, suggested, notes = visitor_journey_audit(page, target.final_url, journey_pages)
+            findings.extend(found)
+            opportunities.extend(suggested)
+            unresolved.extend(notes)
+            for record in journey_pages:
+                opportunities.extend(improvement_opportunity_audit(
+                    record["page"], record["url"], "sampled internal page"))
+            completed.append("visitor-journey")
+        except Exception as exc:
+            unresolved.append(f"visitor-journey: analyzer did not complete: {exc}")
         for future in destination_futures:
             try:
                 found, notes = future.result(timeout=max(.01, governor.remaining_seconds()))
@@ -287,12 +421,13 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     findings.extend(found)
     unresolved.extend(notes)
     completed.append("source-verification")
-    return _report(site, governor, findings, completed, unresolved, opportunities)
+    return _report(site, governor, findings, completed, unresolved, opportunities, journey_coverage)
 
 
 def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]],
             completed: list[str], unresolved: list[str],
-            opportunities: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+            opportunities: list[dict[str, Any]] | None = None,
+            journey_coverage: dict[str, list[dict[str, Any]]] | None = None) -> dict[str, Any]:
     findings = deduplicate_findings(findings)
     opportunities = deduplicate_opportunities(opportunities or [])
     counts = {name: sum(1 for item in findings if item["severity"] == name)
@@ -324,6 +459,8 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
             "checks_completed": [name for name in CHECKS if name in set(completed)],
             "checks_unresolved": list(dict.fromkeys(unresolved)),
             "unresolved_checks": list(dict.fromkeys(unresolved)),
+            "journey": journey_coverage or {
+                "selected_links": [], "crawled_links": [], "skipped_links": []},
         },
         "findings": findings,
         "suggested_actions": opportunities,

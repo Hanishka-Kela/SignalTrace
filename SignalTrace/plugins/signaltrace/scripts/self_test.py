@@ -15,11 +15,12 @@ import unittest
 from analyzers import (
     bot_directives_audit, content_engagement_audit, deduplicate_findings,
     deduplicate_opportunities, destination_observation, improvement_opportunity_audit,
-    parse_page, source_verification, structured_data_audit,
+    parse_page, source_verification, structured_data_audit, visitor_journey_audit,
 )
 from runtime import Evidence, RequestGovernor
 from config import DEFAULTS, USER_AGENT
 from scope import compare_scopes, normalize_scope
+from signaltrace import _select_journey_links
 
 
 class ScopeTests(unittest.TestCase):
@@ -162,7 +163,88 @@ class ImprovementOpportunityTests(unittest.TestCase):
         self.assertEqual(set(item["evidence"]), {"url", "source", "observed"})
         self.assertTrue(item["evidence"]["observed"])
         self.assertIs(item["is_finding"], False)
+        self.assertIn(item["category"], {"discoverability", "engagement", "navigation",
+                                         "trust", "content-clarity", "availability"})
+        self.assertIn(item["evidence"]["source"], {
+            "initial HTML", "sampled internal page", "redirect chain", "robots.txt"})
         self.assertEqual(deduplicate_opportunities([item, dict(item)]), [item])
+
+
+class VisitorJourneyTests(unittest.TestCase):
+    def test_multi_page_fixture_selects_roles_and_broken_link_is_confirmed(self):
+        landing = parse_page("""
+            <nav><a href='/category/books'>Books</a><a href='/about'>About us</a></nav>
+            <main><article><a href='/product/widget'>Widget</a><span>$10.00</span></article>
+            <a href='/search'>Search</a><a href='/returns'>Returns policy</a>
+            <a href='/page/2'>Next</a><a href='/broken'>Broken detail</a></main>
+            """, "https://shop.example/")
+        selected, skipped = _select_journey_links(landing, landing.base_url, 5)
+        self.assertEqual({item["role"] for item in selected},
+                         {"navigation", "detail", "search", "support", "policy"})
+        self.assertTrue(any(item["reason"] == "role already represented in bounded sample"
+                            for item in skipped))
+        link = {"url": "https://shop.example/broken", "text": "Broken detail"}
+        evidence = Evidence(link["url"], link["url"], 404, {}, b"", [], "http-error")
+        findings, _ = destination_observation(link, landing.base_url, evidence, None)
+        self.assertEqual(findings[0]["severity"], "High")
+
+    def test_out_of_stock_without_route_and_waitlist_negative_control(self):
+        no_route = parse_page(
+            "<h1>Widget</h1><p>Out of stock.</p><a href='/'>Home</a>",
+            "https://shop.example/widget")
+        with_waitlist = parse_page(
+            "<h1>Widget</h1><p>Out of stock. Join the waitlist.</p><a href='/waitlist'>Waitlist</a>",
+            "https://shop.example/widget")
+        no_route_codes = {item["_code"] for item in content_engagement_audit(
+            no_route, no_route.base_url)[0]}
+        waitlist_codes = {item["_code"] for item in content_engagement_audit(
+            with_waitlist, with_waitlist.base_url)[0]}
+        self.assertIn("oos-no-route", no_route_codes)
+        self.assertNotIn("oos-no-route", waitlist_codes)
+
+    def test_listing_detail_price_mismatch_is_high_confidence_finding(self):
+        landing = parse_page(
+            "<h1>Widget shop</h1><article><a href='/product/widget'>Widget</a><span>$10.00</span></article>",
+            "https://shop.example/")
+        detail = parse_page(
+            "<h1>Widget</h1><p>Price $12.00. In stock.</p><h2>Specifications</h2>"
+            "<p>Weight: 2 kg</p><button>Add to cart</button>",
+            "https://shop.example/product/widget")
+        link = next(item for item in landing.links if item["url"].endswith("/product/widget"))
+        findings, _, _ = visitor_journey_audit(landing, landing.base_url, [{
+            "role": "detail", "url": detail.base_url, "page": detail, "link": link}])
+        conflict = next(item for item in findings if item["_code"] == "listing-detail-price-conflict")
+        self.assertEqual(conflict["severity"], "High")
+        self.assertEqual(conflict["confidence"], .98)
+
+    def test_vague_landing_gets_value_proposition_opportunity(self):
+        page = parse_page("<main><h1>Welcome</h1><p>Better starts here.</p></main>",
+                          "https://example.com/")
+        _, opportunities, _ = visitor_journey_audit(page, page.base_url, [])
+        self.assertIn("opportunity-value-proposition", {item["id"] for item in opportunities})
+
+    def test_useful_navigation_and_action_avoid_engagement_false_positive(self):
+        page = parse_page(
+            "<title>Acme accounting software</title><nav><a href='/products'>Accounting products</a>"
+            "<a href='/contact'>Contact support</a></nav><main><h1>Accounting software for teams</h1>"
+            "<p>Track invoices and expenses with Acme software.</p><a href='/products'>Browse products</a></main>",
+            "https://example.com/")
+        findings, opportunities, _ = visitor_journey_audit(page, page.base_url, [])
+        self.assertFalse(any(item.get("_code") == "oos-no-route" for item in findings))
+        ids = {item["id"] for item in opportunities}
+        self.assertNotIn("opportunity-value-proposition", ids)
+        self.assertNotIn("opportunity-navigation-labels", ids)
+
+    def test_independent_observations_emit_multiple_opportunities(self):
+        page = parse_page(
+            "<main><h1>Welcome</h1><p>Hello.</p><button></button><input></main>",
+            "https://example.com/")
+        opportunities = improvement_opportunity_audit(page, page.base_url)
+        _, journey, _ = visitor_journey_audit(page, page.base_url, [])
+        combined = deduplicate_opportunities(opportunities + journey)
+        self.assertGreaterEqual(len(combined), 3)
+        self.assertTrue({"opportunity-structured-data", "opportunity-value-proposition",
+                         "opportunity-control-labels"}.issubset({item["id"] for item in combined}))
 
 
 class RuntimeTests(unittest.TestCase):
@@ -224,6 +306,49 @@ class RuntimeTests(unittest.TestCase):
                      "--connect-timeout", "--user-agent", "--compressed"):
             self.assertIn(flag, source)
         self.assertEqual(USER_AGENT, "SignalTrace/1.0")
+
+    def test_unavailable_robots_is_reported_and_bounded_fetch_continues(self):
+        governor = RequestGovernor(max_requests=3, max_concurrency=1, timeout=1,
+                                   max_body_bytes=1000, deadline_seconds=3, max_per_origin=3,
+                                   spacing_seconds=0)
+        calls = []
+        def fake_request(url, *, kind, body_limit):
+            calls.append(url)
+            if url.endswith("/robots.txt"):
+                return Evidence(url, url, 503, {}, b"", [], "http-error", "HTTP 503")
+            return Evidence(url, url, 200, {"content-type": "text/html"}, b"<p>Public</p>", [], "ok")
+        governor._request_with_retries = fake_request  # type: ignore[method-assign]
+        result = governor.fetch("https://example.com/a")
+        self.assertEqual(result.status, 200)
+        self.assertEqual(governor.robots_result(result.final_url)["result"], "http-error")
+        self.assertEqual(calls, ["https://example.com/robots.txt", "https://example.com/a"])
+
+    def test_request_ceiling_spacing_and_deadline_are_preserved(self):
+        governor = RequestGovernor(max_requests=2, target_request_maximum=2, max_concurrency=2,
+                                   timeout=1, max_body_bytes=1000, deadline_seconds=1,
+                                   max_per_origin=2, spacing_seconds=.02)
+        starts = []
+        def fake_curl(url, *, kind, body_limit):
+            origin = governor._origin(url)
+            governor._spacing_wait(origin)
+            _, reserved = governor._reserve(url, kind, body_limit)
+            governor._origin_last_start[origin] = time.monotonic()
+            starts.append(governor._origin_last_start[origin])
+            governor._completed += 1
+            governor._aggregate_reserved -= reserved
+            return Evidence(url, url, 200, {"content-type": "text/plain"},
+                            b"User-agent: *\nAllow: /\n" if kind == "robots" else b"ok", [], "ok")
+        governor._curl_once = fake_curl  # type: ignore[method-assign]
+        governor.fetch("https://example.com/a")
+        with self.assertRaises(Exception):
+            governor.fetch("https://example.com/b")
+        self.assertEqual(governor.snapshot()["requests_started"], 2)
+        self.assertGreaterEqual(starts[1] - starts[0], .018)
+        expired = RequestGovernor(deadline_seconds=.001, spacing_seconds=0)
+        time.sleep(.003)
+        result = expired.fetch("https://example.com/a")
+        self.assertEqual(result.outcome, "robots-denied")
+        self.assertEqual(expired.snapshot()["requests_started"], 0)
 
 
 class PackageTests(unittest.TestCase):

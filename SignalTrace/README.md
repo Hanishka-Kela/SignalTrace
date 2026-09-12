@@ -49,6 +49,8 @@ python3 plugins/signaltrace/scripts/signaltrace.py \
 
 All defaults live in `plugins/signaltrace/scripts/config.py`. Request and per-origin counts include `robots.txt`, redirect hops, and retries. Redirects are advanced manually, each new origin is checked first, same-origin requests are serialized and spaced, cross-origin concurrency is capped at two, every response is cached, URLs are deduplicated, aggregate bytes are bounded, and private/reserved targets are rejected. A denial is never retried through an alternate identity or URL. Robots results distinguish denial, missing policy, unreachable policy, timeout, HTTP error, and parser error.
 
+After the target is fetched, SignalTrace classifies only links present in that cached page. It deterministically selects at most one navigation/category, detail, search/action, support/about, and policy/returns route, up to the configured sample limit. These pages are fetched through the same governor and are never used as seeds for recursive crawling. `coverage.journey` reports the selected and crawled routes plus links skipped because a role was already represented, the sample or request limit was reached, robots denied access, or the deadline expired. A missing or unavailable robots file is explicitly reported as having no usable policy; only the same bounded sample may continue.
+
 Source verification is intentionally opt-in: only URLs explicitly provided in `sources` are fetched. If none are provided, that check reports `not assessed` through coverage rather than inventing corroboration.
 
 ## Input contract
@@ -63,7 +65,7 @@ Every audit is read-only: SignalTrace does not modify a live website, submit for
 
 ## Findings and suggested improvements
 
-A confirmed finding means the audit has direct evidence that something is failing or inaccessible. A suggested improvement means cached evidence supports a reasonable way to strengthen AI discoverability, clarity, trust, or visitor continuation, but failure has not been proven. Missing optional features are never promoted to findings merely because they are absent.
+A confirmed finding means the audit has direct evidence that something is failing, contradictory, or inaccessible. A suggested improvement means cached landing-page and sampled-journey evidence supports a reasonable way to strengthen discoverability, clarity, trust, navigation, availability handling, or visitor continuation, but failure has not been proven. Missing optional features are never promoted to findings merely because they are absent. Static HTML can support observations about labels, readable facts, links, controls, forms, and redirect outcomes; SignalTrace does not claim mobile or visual-design defects without browser rendering.
 
 ```json
 {
@@ -72,7 +74,7 @@ A confirmed finding means the audit has direct evidence that something is failin
     {
       "id": "opportunity-structured-data",
       "priority": "low",
-      "category": "ai-discoverability",
+      "category": "discoverability",
       "action": "Add appropriate machine-readable entity metadata.",
       "reason": "No JSON-LD, Microdata, or RDFa was observed in the fetched HTML.",
       "evidence": {

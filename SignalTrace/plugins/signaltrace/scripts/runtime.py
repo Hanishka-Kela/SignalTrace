@@ -373,13 +373,21 @@ class RequestGovernor:
             if evidence.status in {404, 410}:
                 decision = RobotsDecision("missing", True, f"robots.txt returned HTTP {evidence.status}")
             elif evidence.outcome == "timeout":
-                decision = RobotsDecision("timeout", False, evidence.detail)
+                decision = RobotsDecision(
+                    "timeout", True,
+                    f"no usable robots policy was obtained ({evidence.detail}); bounded audit only")
             elif evidence.status is None or evidence.outcome == "network-error":
-                decision = RobotsDecision("unreachable", False, evidence.detail)
+                decision = RobotsDecision(
+                    "unreachable", True,
+                    f"no usable robots policy was obtained ({evidence.detail}); bounded audit only")
             elif evidence.status != 200:
-                decision = RobotsDecision("http-error", False, f"robots.txt returned HTTP {evidence.status}")
+                decision = RobotsDecision(
+                    "http-error", True,
+                    f"no usable robots policy was obtained (HTTP {evidence.status}); bounded audit only")
             elif evidence.outcome == "body-limit" or b"\x00" in evidence.body:
-                decision = RobotsDecision("parser-error", False, "robots.txt was truncated or contained NUL bytes")
+                decision = RobotsDecision(
+                    "parser-error", True,
+                    "no usable robots policy was obtained (truncated or invalid bytes); bounded audit only")
             else:
                 try:
                     text = evidence.body.decode("utf-8", errors="strict")
@@ -388,7 +396,9 @@ class RequestGovernor:
                     parser.parse(text.splitlines())
                     decision = RobotsDecision("allowed", True, "robots.txt parsed", parser)
                 except (UnicodeDecodeError, ValueError) as exc:
-                    decision = RobotsDecision("parser-error", False, f"robots parser error: {exc}")
+                    decision = RobotsDecision(
+                        "parser-error", True,
+                        f"no usable robots policy was obtained ({exc}); bounded audit only")
         except (LimitError, UnsafeTarget) as exc:
             decision = RobotsDecision("unreachable", False, str(exc))
         finally:

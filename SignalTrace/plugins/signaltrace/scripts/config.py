@@ -20,7 +20,8 @@ class Limits:
     global_deadline_seconds: float = 30.0
     maximum_redirects: int = 5
     robots_body_limit_bytes: int = 256 * 1024
-    selected_link_maximum: int = 3
+    selected_link_maximum: int = 5
+    skipped_link_evidence_maximum: int = 50
 
 
 DEFAULTS = Limits()
