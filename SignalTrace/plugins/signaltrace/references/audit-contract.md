@@ -14,6 +14,8 @@ The small sample is deliberate, not an instruction to consume the available requ
 
 For `sameAs` identity comparison, `og:site_name` is platform-level metadata and is excluded from destination identity candidates and verdict comparisons. It is not evidence about the account or channel owner. Entity-level signals such as `og:title`, `title`, `twitter:title`, `profile:username`, headings, and destination JSON-LD names remain eligible; a destination with no eligible signal is `insufficient-evidence`.
 
+SameAs verdict rollup is deterministic: any `conflicting` source comparison takes precedence over compatible comparisons; `insufficient-evidence` sources do not vote. If no conflict remains and at least one eligible source is compatible, the verdict is `plausible match`; otherwise it is `not assessed`.
+
 ### Observed timings
 
 Captured 2026-09-12 during bounded real-site audits:

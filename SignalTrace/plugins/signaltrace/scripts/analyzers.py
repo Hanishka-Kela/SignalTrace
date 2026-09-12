@@ -1254,6 +1254,24 @@ def _entity_name(page: PageParser) -> str:
                  if item["level"] == "h1" and item["text"]), "") or page.title
 
 
+_PAGE_SCOPED_ENTITY_TYPES = {
+    "webpage", "product", "article", "newsarticle", "blogposting", "recipe",
+    "service", "course", "event", "jobposting", "faqpage", "profilepage",
+}
+
+
+def _page_scoped_entity_names(page: PageParser) -> list[tuple[str, str]]:
+    """Return names from JSON-LD entities that describe this page's own subject."""
+    entities: list[tuple[str, str]] = []
+    for _, node in parsed_jsonld_nodes(page)[0]:
+        if not _types(node).intersection(_PAGE_SCOPED_ENTITY_TYPES):
+            continue
+        name = str(node.get("name") or node.get("headline") or "").strip()
+        if name:
+            entities.append((name, str(node.get("@type") or "")))
+    return entities
+
+
 def _has_next_action(page: PageParser) -> bool:
     action = re.compile(
         r"\b(add to (?:cart|basket)|buy|purchase|book|apply|contact|notify|waitlist|"
@@ -1375,28 +1393,22 @@ def visitor_journey_audit(target_page: PageParser, target_url: str,
                     suggested_action="Publish a self-referencing or correct entity-level canonical for this detail page.",
                     priority=88))
         visible_entity = _entity_name(page)
-        for raw in page.jsonld:
-            try:
-                nodes = list(_walk_jsonld(json.loads(raw)))
-            except (json.JSONDecodeError, TypeError):
-                continue
-            for node in nodes:
-                machine_name = str(node.get("name") or node.get("headline") or "").strip()
-                visible_tokens = set(re.findall(r"[a-z0-9]{3,}", visible_entity.casefold()))
-                machine_tokens = set(re.findall(r"[a-z0-9]{3,}", machine_name.casefold()))
-                if (visible_entity and machine_name and visible_tokens and machine_tokens
-                        and not visible_tokens.intersection(machine_tokens)):
-                    findings.append(finding(
-                        code="visible-machine-identity-conflict",
-                        title="Visible and machine-readable entity names contradict one another",
-                        severity="High", confidence=.96,
-                        evidence={"visible_entity": visible_entity, "machine_entity": machine_name,
-                                  "type": node.get("@type")}, affected_url=item["url"],
-                        evidence_type="cached-visible-text/json-ld",
-                        responsible_party="site-published content",
-                    impact="The fetched visible and machine-readable representations publish different identities for the same page.",
-                        suggested_action="Align the title, primary heading, and scoped machine-readable entity name.",
-                        priority=89))
+        visible_tokens = set(re.findall(r"[a-z0-9]{3,}", visible_entity.casefold()))
+        for machine_name, machine_type in _page_scoped_entity_names(page):
+            machine_tokens = set(re.findall(r"[a-z0-9]{3,}", machine_name.casefold()))
+            if (visible_entity and machine_name and visible_tokens and machine_tokens
+                    and not visible_tokens.intersection(machine_tokens)):
+                findings.append(finding(
+                    code="visible-machine-identity-conflict",
+                    title="Visible and page-scoped machine-readable entity names contradict one another",
+                    severity="High", confidence=.96,
+                    evidence={"visible_entity": visible_entity, "machine_entity": machine_name,
+                              "type": machine_type}, affected_url=item["url"],
+                    evidence_type="cached-visible-text/page-scoped-json-ld",
+                    responsible_party="site-published content",
+                    impact="The fetched visible and page-scoped machine-readable representations publish different identities for the same page.",
+                    suggested_action="Align the title, primary heading, and page-scoped machine-readable entity name.",
+                    priority=89))
 
     # A landing page should quickly identify what is offered and a supported
     # continuation. Generic slogans alone are only an improvement signal.
@@ -1692,6 +1704,16 @@ def _normalized_identity(value: str) -> str:
     return str(scoped["value"] or "")
 
 
+def _compare_same_as_identity(brand: str, candidate: dict[str, str]) -> str:
+    """Compare identity text, allowing platform decoration in the HTML title only."""
+    if candidate.get("source") == "title" and brand.strip() and re.search(
+            rf"(?<!\w){re.escape(brand.strip())}(?!\w)", candidate.get("value", ""), re.I):
+        return "compatible"
+    return compare_scopes(
+        {"entity": "sameAs claim", "predicate": "identity", "value": brand},
+        {"entity": "sameAs claim", "predicate": "identity", "value": candidate["value"]})
+
+
 def _documented_successor(brand: str, page: PageParser) -> bool:
     if not brand:
         return False
@@ -1796,9 +1818,7 @@ def same_as_destination_observation(declaration: dict[str, Any], source_url: str
     brand_normalized = _normalized_identity(brand)
     plausible = False
     for candidate in candidates:
-        compared = compare_scopes(
-            {"entity": "sameAs claim", "predicate": "identity", "value": brand},
-            {"entity": "sameAs claim", "predicate": "identity", "value": candidate["value"]})
+        compared = _compare_same_as_identity(brand, candidate)
         exact_results.append({"source": candidate["source"], "result": compared})
         candidate_normalized = _normalized_identity(candidate["value"])
         if compared == "compatible" or (brand_normalized and candidate_normalized and
@@ -1811,11 +1831,11 @@ def same_as_destination_observation(declaration: dict[str, Any], source_url: str
     if successor:
         result["identity_verdict"] = "documented successor"
         return findings, unresolved, result
-    if plausible:
-        result["identity_verdict"] = "plausible match"
-        return findings, unresolved, result
     if "conflicting" in comparison_results:
         result["identity_verdict"] = "conflicting"
+    elif plausible:
+        result["identity_verdict"] = "plausible match"
+        return findings, unresolved, result
     elif comparison_results and all(item == "insufficient-evidence" for item in comparison_results):
         result["identity_verdict"] = "not assessed"
         unresolved.append(

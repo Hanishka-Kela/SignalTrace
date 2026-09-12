@@ -273,7 +273,24 @@ class AnalyzerTests(unittest.TestCase):
                          {"og:title", "title"})
         self.assertIn({"source": "og:title", "result": "compatible"},
                   result["scope_comparisons"])
+        self.assertIn({"source": "title", "result": "compatible"},
+                      result["scope_comparisons"])
         self.assertEqual(result["identity_verdict"], "plausible match")
+
+    def test_mixed_same_as_comparisons_roll_up_to_conflicting(self):
+        declaration = {"url": "https://social.example/frido", "brand": "Frido",
+                       "node_type": "Organization", "block": 1}
+        destination = parse_page(
+            '<title>Another Company</title>'
+            '<meta property="og:title" content="Frido">', declaration["url"])
+        evidence = Evidence(declaration["url"], declaration["url"], 200,
+                            {"content-type": "text/html"}, b"", [], "ok")
+        findings, _, result = same_as_destination_observation(
+            declaration, "https://frido.example/", evidence, destination)
+        self.assertEqual({item["result"] for item in result["scope_comparisons"]},
+                         {"compatible", "conflicting"})
+        self.assertEqual(result["identity_verdict"], "conflicting")
+        self.assertEqual(len(findings), 1)
 
     def test_dead_same_as_is_a_high_identity_finding(self):
         declaration = {"url": "https://social.example/missing", "brand": "Acme",
@@ -523,6 +540,46 @@ class ImprovementOpportunityTests(unittest.TestCase):
 
 
 class VisitorJourneyTests(unittest.TestCase):
+    def test_sitewide_organization_does_not_conflict_with_page_heading(self):
+        fixtures = (
+            ("Contact Us", "Contact Us"),
+            ("Demand More from Your Work Less from Your Body.",
+             "Demand More from Your Work Less from Your Body."),
+        )
+        for heading, title in fixtures:
+            page = parse_page(
+                '<script type="application/ld+json">'
+                '{"@type":"Organization","name":"Frido"}</script>'
+                f"<title>{title}</title><h1>{heading}</h1>",
+                "https://myfrido.example/page")
+            findings, _, _ = visitor_journey_audit(page, page.base_url, [])
+            self.assertFalse(any(item.get("_code") == "visible-machine-identity-conflict"
+                                 for item in findings))
+
+    def test_page_scoped_entity_conflict_remains_a_finding(self):
+        page = parse_page(
+            '<script type="application/ld+json">'
+            '{"@type":"Organization","name":"Frido"}</script>'
+            '<script type="application/ld+json">'
+            '{"@type":"WebPage","name":"Contact Us"}</script>'
+            "<title>Frido Business</title><h1>Frido Business</h1>",
+            "https://myfrido.example/contact")
+        findings, _, _ = visitor_journey_audit(page, page.base_url, [])
+        conflict = next(item for item in findings
+                        if item.get("_code") == "visible-machine-identity-conflict")
+        self.assertEqual(conflict["evidence"]["machine_entity"], "Contact Us")
+        self.assertEqual(conflict["evidence"]["type"], "WebPage")
+
+    def test_sitewide_organization_matching_homepage_is_not_a_conflict(self):
+        page = parse_page(
+            '<script type="application/ld+json">'
+            '{"@type":"Organization","name":"Frido"}</script>'
+            "<title>Frido</title><h1>Frido</h1>",
+            "https://myfrido.example/")
+        findings, _, _ = visitor_journey_audit(page, page.base_url, [])
+        self.assertFalse(any(item.get("_code") == "visible-machine-identity-conflict"
+                             for item in findings))
+
     def test_same_opportunity_type_on_two_pages_has_distinct_stable_ids(self):
         landing = parse_page(
             "<title>Widget shop</title><h1>Widget shop</h1><button></button>",
