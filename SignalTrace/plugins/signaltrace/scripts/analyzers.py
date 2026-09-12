@@ -19,10 +19,44 @@ def compact(value: str, limit: int = 280) -> str:
     return value if len(value) <= limit else value[:limit - 1] + "…"
 
 
+_TRACKING_PARAMETER_NAMES = {
+    "gclid", "gad_source", "gad_campaignid", "gbraid", "clickid", "fbclid",
+    "dclid", "msclkid", "twclid", "mc_cid", "mc_eid",
+}
+
+
+def canonicalize_url(url: str) -> str:
+    """Remove known tracking-only query parameters while preserving page scope."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    if not parts.query:
+        return url
+    kept = [(key, value) for key, value in urllib.parse.parse_qsl(
+        parts.query, keep_blank_values=True)
+            if key.casefold() not in _TRACKING_PARAMETER_NAMES
+            and not key.casefold().startswith(("utm_", "af_"))]
+    query = urllib.parse.urlencode(kept, doseq=True)
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
+
+
+def _canonicalize_url_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: (canonicalize_url(item) if isinstance(item, str) and
+                      (key == "url" or key.endswith("_url")) else
+                      _canonicalize_url_fields(item)) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_canonicalize_url_fields(item) for item in value]
+    return value
+
+
 def finding(*, code: str, title: str, severity: str, confidence: float,
             evidence: Any, affected_url: str, evidence_type: str,
             responsible_party: str, impact: str, suggested_action: str,
             priority: int, coverage_status: str = "confirmed") -> dict[str, Any]:
+    affected_url = canonicalize_url(affected_url)
+    evidence = _canonicalize_url_fields(evidence)
     stable = "|".join((code, affected_url, json.dumps(evidence, sort_keys=True)))
     return {
         "id": "ST-" + hashlib.sha256(stable.encode()).hexdigest()[:10].upper(),
@@ -53,7 +87,7 @@ def opportunity(*, rule_id: str, priority: str, category: str, action: str,
         "action": action,
         "reason": reason,
         "evidence": {
-            "url": url,
+            "url": canonicalize_url(url),
             "source": source,
             "observed": compact(observed) if isinstance(observed, str) else observed,
         },
@@ -1128,9 +1162,43 @@ def deduplicate_opportunities(items: list[dict[str, Any]]) -> list[dict[str, Any
                 scoped_id = f"{scoped_id}-{suffix}"
             item["id"] = scoped_id
             used.add(scoped_id)
+    merged = _consolidate_opportunities(merged, "")
     return sorted(merged, key=lambda item: (
         priority_order[item["priority"]], item["id"],
         _normalized_opportunity_url(item["evidence"]["url"])))
+
+
+def _opportunity_root_key(item: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (item["id"], item.get("category", ""), item.get("action", ""), item.get("reason", ""))
+
+
+def _consolidate_opportunities(items: list[dict[str, Any]], target_url: str) -> list[dict[str, Any]]:
+    """Merge same-root opportunities across pages while retaining page evidence."""
+    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for item in items:
+        grouped.setdefault(_opportunity_root_key(item), []).append(item)
+    result: list[dict[str, Any]] = []
+    for group in grouped.values():
+        urls = {_normalized_opportunity_url(item["evidence"]["url"]) for item in group}
+        if len(urls) < 2:
+            result.extend(group)
+            continue
+        canonical = deepcopy(min(group, key=lambda value: json.dumps(value, sort_keys=True)))
+        pages = []
+        for item in sorted(group, key=lambda value: _normalized_opportunity_url(value["evidence"]["url"])):
+            evidence = item["evidence"]
+            observed = evidence.get("observed")
+            occurrence_count = 1
+            if isinstance(observed, list):
+                occurrence_count = sum(
+                    int(control.get("occurrence_count", 1))
+                    for control in observed if isinstance(control, dict)) or 1
+            pages.append({"url": evidence["url"], "source": evidence.get("source"),
+                          "observed": observed, "occurrence_count": occurrence_count})
+        canonical["evidence"]["url"] = canonicalize_url(target_url) if target_url else pages[0]["url"]
+        canonical["evidence"]["observed"] = pages
+        result.append(canonical)
+    return result
 
 
 def classify_link(link: dict[str, str]) -> str:
@@ -1548,7 +1616,6 @@ def same_as_declarations(page: PageParser, site_url: str) -> tuple[list[dict[str
     unresolved: list[str] = []
     seen: set[tuple[str, str]] = set()
     saw_property = False
-    visible_name = str(page_identity(page).get("value") or "").strip()
     for block, node in parsed_nodes:
         identity_types = _types(node) & {"organization", "person"}
         if not identity_types or "sameAs" not in node:
@@ -1556,7 +1623,7 @@ def same_as_declarations(page: PageParser, site_url: str) -> tuple[list[dict[str
         saw_property = True
         raw_values = node.get("sameAs")
         values = raw_values if isinstance(raw_values, list) else [raw_values]
-        brand = str(node.get("name") or visible_name).strip()
+        brand = str(node.get("name") or "").strip()
         for raw in values:
             value = raw.get("@id") if isinstance(raw, dict) else raw
             if not isinstance(value, str) or not value.strip():
@@ -1737,6 +1804,7 @@ def same_as_destination_observation(declaration: dict[str, Any], source_url: str
                 (brand_normalized in candidate_normalized or candidate_normalized in brand_normalized)):
             plausible = True
     result["scope_comparisons"] = exact_results
+    comparison_results = [item["result"] for item in exact_results]
     successor = _documented_successor(brand, destination_page)
     result["documented_successor"] = successor
     if successor:
@@ -1744,6 +1812,13 @@ def same_as_destination_observation(declaration: dict[str, Any], source_url: str
         return findings, unresolved, result
     if plausible:
         result["identity_verdict"] = "plausible match"
+        return findings, unresolved, result
+    if "conflicting" in comparison_results:
+        result["identity_verdict"] = "conflicting"
+    elif comparison_results and all(item == "insufficient-evidence" for item in comparison_results):
+        result["identity_verdict"] = "not assessed"
+        unresolved.append(
+            f"sameAs-identity: {declared_url} did not contain a declared comparable name; not assessed")
         return findings, unresolved, result
 
     generic = re.compile(

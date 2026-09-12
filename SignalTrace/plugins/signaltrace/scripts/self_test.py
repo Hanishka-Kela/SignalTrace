@@ -21,6 +21,7 @@ from analyzers import (
     deduplicate_opportunities, destination_observation, improvement_opportunity_audit,
     finding, opportunity, parse_page, same_as_declarations, same_as_destination_observation,
     source_verification, structured_data_audit, visitor_journey_audit,
+    _consolidate_opportunities, canonicalize_url,
 )
 from runtime import Evidence, LimitError, RequestGovernor, RobotsDecision
 from config import DEFAULTS, USER_AGENT
@@ -136,6 +137,48 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(status, "applicable")
         self.assertEqual(unresolved, [])
         self.assertEqual(declarations[0]["node_type"], "Person")
+
+    def test_graph_wrapped_same_as_without_name_is_insufficient_evidence(self):
+        page = parse_page(
+            '<script type="application/ld+json">{"@graph":[{"@type":"Organization",'
+            '"sameAs":["https://social.example/myntra"]}]}</script>'
+            '<h1>ONLINE SHOPPING MADE EASY AT MYNTRA</h1>', "https://shop.example/")
+        declarations, unresolved, status = same_as_declarations(page, page.base_url)
+        self.assertEqual(status, "applicable")
+        self.assertEqual(declarations[0]["brand"], "")
+        destination = parse_page('<meta property="og:title" content="Myntra">', declarations[0]["url"])
+        evidence = Evidence(declarations[0]["url"], declarations[0]["url"], 200,
+                            {"content-type": "text/html"}, b"", [], "ok")
+        _, _, result = same_as_destination_observation(
+            declarations[0], page.base_url, evidence, destination)
+        self.assertTrue(result["scope_comparisons"])
+        self.assertTrue(all(item["result"] == "insufficient-evidence"
+                            for item in result["scope_comparisons"]))
+        self.assertEqual(result["identity_verdict"], "not assessed")
+        self.assertEqual(unresolved, [])
+
+    def test_identity_verdict_reflects_contradictory_scope_comparisons(self):
+        declaration = {"url": "https://social.example/acme", "brand": "Acme",
+                       "node_type": "Organization", "block": 1}
+        destination = parse_page(
+            '<h1>Different Company</h1><meta property="og:title" content="Different Company">',
+            declaration["url"])
+        evidence = Evidence(declaration["url"], declaration["url"], 200,
+                            {"content-type": "text/html"}, b"", [], "ok")
+        _, _, result = same_as_destination_observation(
+            declaration, "https://acme.example/", evidence, destination)
+        self.assertIn("conflicting", {item["result"] for item in result["scope_comparisons"]})
+        self.assertEqual(result["identity_verdict"], "conflicting")
+
+    def test_tracking_parameters_are_removed_from_finding_urls(self):
+        requested = "https://example.com/item?sku=42&utm_source=test&gclid=abc&af_dp=app"
+        self.assertEqual(canonicalize_url(requested), "https://example.com/item?sku=42")
+        item = finding(code="fixture", title="Fixture", severity="Medium", confidence=1,
+                       evidence={"requested_url": requested}, affected_url=requested,
+                       evidence_type="fixture", responsible_party="unresolved", impact="Observed.",
+                       suggested_action="Review.", priority=1)
+        self.assertEqual(item["affected_url"], "https://example.com/item?sku=42")
+        self.assertEqual(item["evidence"]["requested_url"], "https://example.com/item?sku=42")
 
     def test_graph_wrapped_organization_same_as_is_extracted(self):
         page = parse_page(
