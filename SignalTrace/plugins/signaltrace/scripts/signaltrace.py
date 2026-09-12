@@ -12,8 +12,9 @@ import urllib.parse
 from typing import Any
 
 from analyzers import (
-    bot_directives_audit, content_engagement_audit, deduplicate_findings, destination_observation,
-    finding, parse_page, source_verification, structured_data_audit,
+    bot_directives_audit, content_engagement_audit, deduplicate_findings,
+    deduplicate_opportunities, destination_observation, finding,
+    improvement_opportunity_audit, parse_page, source_verification, structured_data_audit,
 )
 from runtime import Evidence, LimitError, RequestGovernor, UnsafeTarget
 from config import DEFAULTS
@@ -21,6 +22,7 @@ from config import DEFAULTS
 CHECKS = [
     "robots-policy", "target-fetch", "bot-directives", "structured-data",
     "content-engagement", "citation-destination", "source-verification",
+    "improvement-opportunities",
 ]
 
 
@@ -166,6 +168,7 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     )
     requested_site = str(payload["site"])
     findings: list[dict[str, Any]] = []
+    opportunities: list[dict[str, Any]] = []
     completed, unresolved = [], []
     try:
         site = governor.normalize_url(requested_site)
@@ -246,6 +249,7 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             pool.submit(structured_data_audit, page, target.final_url): "structured-data",
             pool.submit(content_engagement_audit, page, target.final_url): "content-engagement",
         }
+        opportunity_future = pool.submit(improvement_opportunity_audit, page, target.final_url)
         destination_futures = [pool.submit(_audit_destination, governor, target.final_url, link) for link in links]
         source_futures = [pool.submit(_fetch_source, governor, url) for url in sources]
         for future, name in local_futures.items():
@@ -256,6 +260,12 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
                 completed.append(name)
             except Exception as exc:
                 unresolved.append(f"{name}: analyzer did not complete: {exc}")
+        try:
+            opportunities.extend(
+                opportunity_future.result(timeout=max(.01, governor.remaining_seconds())))
+            completed.append("improvement-opportunities")
+        except Exception as exc:
+            unresolved.append(f"improvement-opportunities: analyzer did not complete: {exc}")
         for future in destination_futures:
             try:
                 found, notes = future.result(timeout=max(.01, governor.remaining_seconds()))
@@ -277,12 +287,14 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     findings.extend(found)
     unresolved.extend(notes)
     completed.append("source-verification")
-    return _report(site, governor, findings, completed, unresolved)
+    return _report(site, governor, findings, completed, unresolved, opportunities)
 
 
 def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]],
-            completed: list[str], unresolved: list[str]) -> dict[str, Any]:
+            completed: list[str], unresolved: list[str],
+            opportunities: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     findings = deduplicate_findings(findings)
+    opportunities = deduplicate_opportunities(opportunities or [])
     counts = {name: sum(1 for item in findings if item["severity"] == name)
               for name in ("Critical", "High", "Medium")}
     snapshot = governor.snapshot()
@@ -290,13 +302,6 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
         robots_result = governor.robots_result(site)
     except (UnsafeTarget, ValueError):
         robots_result = {"result": "not-checked", "detail": "invalid or unsupported target URL"}
-    actions, seen_actions = [], set()
-    for item in findings:
-        action = item["suggested_action"]
-        if action not in seen_actions:
-            actions.append({"priority": item["priority"], "action": action,
-                            "finding_ids": [item["id"]]})
-            seen_actions.add(action)
     return {
         "site": site,
         "audited_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
@@ -321,7 +326,7 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
             "unresolved_checks": list(dict.fromkeys(unresolved)),
         },
         "findings": findings,
-        "suggested_actions": actions,
+        "suggested_actions": opportunities,
     }
 
 

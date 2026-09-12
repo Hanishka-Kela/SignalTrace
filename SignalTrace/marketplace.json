@@ -26,6 +26,11 @@
       "id": "source-verification-audit",
       "path": "plugins/signaltrace/skills/source-verification-audit",
       "entrypoint": false
+    },
+    {
+      "id": "improvement-opportunity-audit",
+      "path": "plugins/signaltrace/skills/improvement-opportunity-audit",
+      "entrypoint": false
     }
   ]
 }

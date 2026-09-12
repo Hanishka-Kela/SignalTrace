@@ -1,0 +1,6 @@
+interface:
+  display_name: "Improvement Opportunity Audit"
+  short_description: "Suggest evidence-backed non-defect improvements"
+  default_prompt: "Use $improvement-opportunity-audit on cached SignalTrace evidence."
+policy:
+  allow_implicit_invocation: false

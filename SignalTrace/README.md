@@ -6,7 +6,7 @@ SignalTrace is a recommendation-only, read-only Agent Skill marketplace package 
 
 ## Package layout
 
-The repository-level contest `marketplace.json` declares exactly five Agent Skills. `audit-entrypoint` is its only entrypoint; the other four skills are bounded specialists used by it. `.codex-plugin/plugin.json` remains separate optional Codex package metadata and is not the contest manifest.
+The repository-level contest `marketplace.json` declares six Agent Skills: the five original audit skills plus `improvement-opportunity-audit`. `audit-entrypoint` remains the only entrypoint; all other skills are bounded specialists. `.codex-plugin/plugin.json` remains separate optional Codex package metadata and is not the contest manifest.
 
 ```text
 marketplace.json
@@ -20,6 +20,7 @@ plugins/signaltrace/
     content-engagement-audit/
     citation-destination-audit/
     source-verification-audit/
+    improvement-opportunity-audit/
 ```
 
 ## Run an audit
@@ -59,6 +60,32 @@ The CLI accepts either a positional URL or one stdin JSON object. Positional URL
 - `claims` (optional): scoped claim objects using the fields in `references/audit-contract.md`.
 
 Every audit is read-only: SignalTrace does not modify a live website, submit forms, or trigger site actions. Requests remain bounded, politely spaced, and robots.txt-aware under the shared governor.
+
+## Findings and suggested improvements
+
+A confirmed finding means the audit has direct evidence that something is failing or inaccessible. A suggested improvement means cached evidence supports a reasonable way to strengthen AI discoverability, clarity, trust, or visitor continuation, but failure has not been proven. Missing optional features are never promoted to findings merely because they are absent.
+
+```json
+{
+  "findings": [],
+  "suggested_actions": [
+    {
+      "id": "opportunity-structured-data",
+      "priority": "low",
+      "category": "ai-discoverability",
+      "action": "Add appropriate machine-readable entity metadata.",
+      "reason": "No JSON-LD, Microdata, or RDFa was observed in the fetched HTML.",
+      "evidence": {
+        "url": "https://example.com/",
+        "source": "initial HTML",
+        "observed": "No machine-readable metadata detected"
+      },
+      "confidence": "certain",
+      "is_finding": false
+    }
+  ]
+}
+```
 
 CLI options override the default resource limits. Exit code `0` means a valid audit report was emitted, including reports where access was denied or the URL is outside the supported public HTTP(S) scope. Exit code `2` is reserved for a missing or malformed input envelope, for which no audit JSON can be constructed.
 

@@ -41,4 +41,4 @@ Deduplicate by normalized affected URL plus underlying defect and scope. When on
 
 ## Final report
 
-Emit exactly one object with `site`, RFC 3339 UTC `audited_at`, `summary`, `coverage`, `findings`, and `suggested_actions`. `suggested_actions` is a deduplicated priority-ordered projection of finding actions. Partial or denied audits still return the schema with explicit unresolved coverage.
+Emit exactly one object with `site`, RFC 3339 UTC `audited_at`, `summary`, `coverage`, `findings`, and `suggested_actions`. Findings are directly established defects and retain their own remediation field. Top-level `suggested_actions` contains only evidence-backed improvement opportunities with `is_finding: false`; it is never a projection of findings. Deduplicate opportunities by stable rule ID and evidence URL, then sort high, medium, low, and stable rule ID. Partial or denied audits still return both arrays and explicit unresolved coverage.
