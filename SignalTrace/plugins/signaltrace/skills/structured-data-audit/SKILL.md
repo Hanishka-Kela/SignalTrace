@@ -2,6 +2,7 @@
 name: structured-data-audit
 description: Inspect cached public HTML for structured-data validity, feature-minimum properties, entity identity, and like-scope agreement. Use as a bounded SignalTrace specialist, not as an independent crawler.
 license: MIT
+allowed-tools: [python]
 ---
 
 # Structured data audit

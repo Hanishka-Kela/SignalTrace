@@ -20,6 +20,7 @@ from typing import Any
 from config import DEFAULTS, USER_AGENT
 
 REDIRECTS = {301, 302, 303, 307, 308}
+CRAWL_DELAY_CAP_SECONDS: float = 30.0
 
 
 class LimitError(RuntimeError):
@@ -107,6 +108,8 @@ class RequestGovernor:
         self._origin_target_started: dict[str, int] = {}
         self._origin_locks: dict[str, threading.Lock] = {}
         self._origin_last_start: dict[str, float] = {}
+        self._origin_spacing: dict[str, float] = {}  # effective per-origin spacing after Crawl-delay
+        self._origin_crawl_delay_declared: dict[str, float] = {}  # raw declared Crawl-delay value
         self._origin_server_failures: dict[str, int] = {}
         self._blocked_origins: dict[str, str] = {}
         self._cache: dict[str, Evidence] = {}
@@ -239,7 +242,8 @@ class RequestGovernor:
 
     def _spacing_wait(self, origin: str) -> None:
         with self._lock:
-            wait = max(0.0, self.spacing_seconds - (time.monotonic() - self._origin_last_start.get(origin, 0.0)))
+            spacing = self._origin_spacing.get(origin, self.spacing_seconds)
+            wait = max(0.0, spacing - (time.monotonic() - self._origin_last_start.get(origin, 0.0)))
         if wait:
             if wait >= self.remaining_seconds():
                 raise LimitError("global deadline would expire during same-origin spacing")
@@ -423,6 +427,42 @@ class RequestGovernor:
                     result.detail = "recovered via HTTP/1.1 fresh-connect fallback"
         return result
 
+    @staticmethod
+    def _parse_crawl_delay(robots_text: str) -> float | None:
+        """Extract Crawl-delay for SignalTrace or the wildcard user-agent group.
+
+        Scans line-by-line; prefers a SignalTrace-specific group over '*'.
+        Returns the declared value as a float, or None when not declared.
+        This is intentionally narrow: it only handles the Crawl-delay directive,
+        not a general robots.txt reimplementation.
+        """
+        specific: float | None = None
+        wildcard: float | None = None
+        in_specific = False
+        in_wildcard = False
+        for raw_line in robots_text.splitlines():
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            lower = line.lower()
+            if lower.startswith("user-agent:"):
+                agent = line[len("user-agent:"):].strip().lower()
+                in_specific = agent == USER_AGENT.lower() or agent == "signaltrace"
+                in_wildcard = agent == "*"
+                continue
+            if lower.startswith("crawl-delay:"):
+                raw_val = line[len("crawl-delay:"):].strip()
+                try:
+                    val = float(raw_val)
+                    if val >= 0:
+                        if in_specific and specific is None:
+                            specific = val
+                        elif in_wildcard and wildcard is None:
+                            wildcard = val
+                except ValueError:
+                    pass
+        return specific if specific is not None else wildcard
+
     def _load_robots(self, url: str) -> RobotsDecision:
         origin = self._origin(url)
         with self._lock:
@@ -470,6 +510,14 @@ class RequestGovernor:
                     parser.set_url(robots_url)
                     parser.parse(text.splitlines())
                     decision = RobotsDecision("allowed", True, "robots.txt parsed", parser)
+                    # Apply Crawl-delay: use max(floor, declared), capped at CRAWL_DELAY_CAP_SECONDS.
+                    # Only set when a Crawl-delay directive is actually present.
+                    declared = self._parse_crawl_delay(text)
+                    if declared is not None:
+                        effective = min(CRAWL_DELAY_CAP_SECONDS, max(self.spacing_seconds, declared))
+                        with self._lock:
+                            self._origin_spacing[origin] = effective
+                            self._origin_crawl_delay_declared[origin] = declared
                 except (UnicodeDecodeError, ValueError) as exc:
                     decision = RobotsDecision(
                         "unavailable", True,
@@ -494,14 +542,28 @@ class RequestGovernor:
             return False, "denied: robots.txt disallows this URL"
         return True, f"{decision.result}: {decision.detail}"
 
-    def robots_result(self, url: str) -> dict[str, str]:
+    def robots_result(self, url: str) -> dict[str, Any]:
         normalized = self.normalize_url(url)
-        decision = self._robots.get(self._origin(normalized))
+        origin = self._origin(normalized)
+        decision = self._robots.get(origin)
         if not decision:
             return {"result": "not-checked", "detail": "robots policy not evaluated"}
         allowed, reason = self.permission(normalized)
         result = decision.result if allowed else ("denied" if reason.startswith("denied:") else decision.result)
-        return {"result": result, "detail": reason}
+        out: dict[str, Any] = {"result": result, "detail": reason}
+        # Include crawl_delay_applied only when a Crawl-delay directive was actually declared.
+        with self._lock:
+            effective = self._origin_spacing.get(origin)
+            declared_raw = self._origin_crawl_delay_declared.get(origin)
+        if effective is not None:
+            out["crawl_delay_applied"] = effective
+            # Append cap notice only when the declared value strictly exceeded the cap.
+            if declared_raw is not None and declared_raw > CRAWL_DELAY_CAP_SECONDS:
+                out["detail"] = reason + (
+                    f"; declared Crawl-delay {declared_raw:g} exceeded cap, "
+                    f"effective spacing set to {CRAWL_DELAY_CAP_SECONDS:g} s"
+                )
+        return out
 
     def crawl_policy(self, url: str) -> dict[str, Any]:
         """Describe the bounded scheduling policy without implying authorization."""

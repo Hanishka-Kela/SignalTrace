@@ -347,6 +347,22 @@ def _journey_coverage_note(journey_links: list[dict[str, str]]) -> str | None:
         "journey coverage is limited to the target page itself.")
 
 
+def _journey_skip_reasons(skipped: list[dict[str, str]],
+                          selected: list[dict[str, str]]) -> str:
+    """Summarize why all selected journey links were skipped after fetch."""
+    selected_urls = {item["url"] for item in selected}
+    reasons = [item["reason"] for item in skipped if item.get("url") in selected_urls]
+    if not reasons:
+        return "reason not recorded"
+    counts: dict[str, int] = {}
+    for r in reasons:
+        counts[r] = counts.get(r, 0) + 1
+    return "; ".join(
+        f"{n} {reason}" if n > 1 else reason
+        for reason, n in sorted(counts.items())
+    )
+
+
 def _journey_sample_limit(robots_result: dict[str, str], requested_limit: int) -> int:
     """Reduce, never expand, the sample when no usable robots policy was fetched."""
     requested_limit = max(0, requested_limit)
@@ -657,6 +673,15 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
                     journey_pages.append(record)
             except Exception as exc:
                 unresolved.append(f"visitor-journey: check did not complete: {exc}")
+        # All selected journey links were fetched but none produced usable HTML.
+        # This is a distinct case from zero links being selected — different cause, different note.
+        if journey_links and not journey_pages:
+            skip_reasons = _journey_skip_reasons(
+                journey_coverage["skipped_links"], journey_links)
+            unresolved.append(
+                f"visitor-journey: {len(journey_links)} link(s) were selected but none "
+                f"resolved to a usable HTML representation ({skip_reasons}); "
+                "journey coverage is limited to the target page itself.")
         try:
             found, suggested, notes = visitor_journey_audit(page, target_url, journey_pages)
             findings.extend(found)

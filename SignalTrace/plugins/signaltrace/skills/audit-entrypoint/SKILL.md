@@ -2,6 +2,7 @@
 name: audit-entrypoint
 description: Run a complete read-only SignalTrace audit of a public website URL and emit one evidence-backed JSON report. This is the only marketplace entrypoint; use it for end-to-end audits rather than isolated specialist interpretation.
 license: MIT
+allowed-tools: [bash, python]
 ---
 
 # SignalTrace audit entrypoint

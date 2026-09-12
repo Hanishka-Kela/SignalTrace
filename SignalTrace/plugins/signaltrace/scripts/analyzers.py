@@ -435,6 +435,9 @@ def structured_data_audit(page: PageParser, url: str) -> tuple[list[dict], list[
             impact="Consumers cannot parse this structured-data block.",
             suggested_action=f"Correct JSON syntax in JSON-LD block {index} at line {error['line']}, column {error['column']}.",
             priority=65))
+        unresolved.append(
+            f"structured-data: block {index} failed to parse; "
+            "downstream schema-based checks for this block were not evaluated")
     rules = {
         "product": (("name",), ("offers", "aggregateRating", "review", "sku", "description")),
         "article": (("headline",), ()),

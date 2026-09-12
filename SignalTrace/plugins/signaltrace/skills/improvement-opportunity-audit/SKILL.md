@@ -2,6 +2,7 @@
 name: improvement-opportunity-audit
 description: Identify evidence-backed improvements for AI discoverability and visitor engagement without treating absent optional features as defects.
 license: MIT
+allowed-tools: [python]
 ---
 
 # Improvement opportunity audit

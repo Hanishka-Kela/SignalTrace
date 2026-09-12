@@ -114,6 +114,23 @@ This analysis still uses only pages obtained through the same bounded, robots-aw
 
 CLI options override the default resource limits. Exit code `0` means a valid audit report was emitted, including reports where access was denied or the URL is outside the supported public HTTP(S) scope. Exit code `2` is reserved for a missing or malformed input envelope, for which no audit JSON can be constructed.
 
+## Skill frontmatter conventions
+
+Each `SKILL.md` file's YAML frontmatter includes an `allowed-tools` field:
+
+```yaml
+allowed-tools: [bash, python]   # audit-entrypoint only (shells out to run signaltrace.py)
+allowed-tools: [python]         # all specialist skills (cached-evidence analysis only)
+```
+
+**This field is a SignalTrace-specific convention layered on top of the agentskills.io spec. It is not defined by the agentskills.io spec itself.** It serves as machine-readable documentation of the tool surface each skill is permitted to invoke directly:
+
+- `bash` — the skill may execute shell commands (only `audit-entrypoint`, which runs `signaltrace.py`).
+- `python` — the skill invokes Python scripts or modules.
+- `curl` is never listed because the governor inside `signaltrace.py` is the only component authorized to execute curl; skills do not call curl directly.
+
+This field carries no runtime enforcement — it is documentation and metadata only.
+
 ## Validate
 
 ```bash

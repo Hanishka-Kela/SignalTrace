@@ -23,12 +23,12 @@ from analyzers import (
     source_verification, structured_data_audit, visitor_journey_audit,
     _consolidate_opportunities, canonicalize_url,
 )
-from runtime import Evidence, LimitError, RequestGovernor, RobotsDecision
+from runtime import Evidence, LimitError, RequestGovernor, RobotsDecision, CRAWL_DELAY_CAP_SECONDS
 from config import DEFAULTS, USER_AGENT
 from scope import compare_scopes, normalize_scope
 from signaltrace import (
     _audit_same_as, _consolidate_opportunities, _journey_sample_limit, _report,
-    _journey_coverage_note, _select_journey_links, _source_verification_state,
+    _journey_coverage_note, _journey_skip_reasons, _select_journey_links, _source_verification_state,
 )
 
 
@@ -128,6 +128,49 @@ class AnalyzerTests(unittest.TestCase):
                           "https://example.com/")
         ids = {item["id"] for item in improvement_opportunity_audit(page, page.base_url)}
         self.assertIn("opportunity-faq-schema", ids)
+    def test_invalid_jsonld_block_produces_downstream_skip_note(self):
+        """A single invalid-JSON Organization block: jsonld-invalid fires + downstream skip noted."""
+        # This reproduces the boAt/brittanychiang scenario where the only JSON-LD block
+        # is invalid, so schema-minimum-organization and opportunity-organization-sameas
+        # never see a parsed Organization node.
+        html = (
+            '<script type="application/ld+json">'
+            '{"@type":"Organization","name":"Acme","sameAs":["https://social.example/acme"] bad}'
+            '</script>'
+        )
+        page = parse_page(html, "https://acme.example/")
+        findings, unresolved = structured_data_audit(page, page.base_url)
+        codes = {f["_code"] for f in findings}
+        # The parse failure itself is reported as a finding.
+        self.assertIn("jsonld-invalid", codes)
+        # An unresolved note explains that downstream checks were not evaluated.
+        self.assertTrue(any("block 1 failed to parse" in n for n in unresolved),
+                        f"Expected downstream-skip note in unresolved, got: {unresolved}")
+        self.assertTrue(any("downstream schema-based checks" in n for n in unresolved))
+        # Downstream checks correctly produce no output (no parsed node to evaluate).
+        opp_ids = {o["id"] for o in improvement_opportunity_audit(page, page.base_url)}
+        self.assertNotIn("opportunity-organization-sameas", opp_ids)
+        # schema-minimum-organization also does not fire (no parsed Organization node).
+        self.assertNotIn("schema-minimum-organization", codes)
+
+    def test_invalid_jsonld_block_does_not_suppress_valid_block_downstream_checks(self):
+        """Invalid block + valid Organization block: only the invalid block gets the note."""
+        html = (
+            '<script type="application/ld+json">{"@type":"Product","name":"Widget" bad}</script>'
+            '<script type="application/ld+json">{"@type":"Organization","name":"Acme",'
+            '"sameAs":["https://social.example/acme"]}</script>'
+        )
+        page = parse_page(html, "https://acme.example/")
+        findings, unresolved = structured_data_audit(page, page.base_url)
+        # Block 1 (invalid) gets the note; block 2 (valid Organization) does not.
+        self.assertTrue(any("block 1 failed to parse" in n for n in unresolved))
+        self.assertFalse(any("block 2 failed to parse" in n for n in unresolved))
+        # The valid Organization block's downstream opportunity fires (sameAs present → suppressed).
+        from analyzers import same_as_declarations
+        declarations, _, status = same_as_declarations(page, page.base_url)
+        self.assertEqual(status, "applicable")
+        self.assertEqual(len(declarations), 1)
+
     def test_conflicting_bot_directives_are_localized(self):
         page = parse_page("<meta name='robots' content='index, noindex'><p>Answer</p>",
                           "https://example.com")
@@ -910,6 +953,65 @@ class VisitorJourneyTests(unittest.TestCase):
         self.assertTrue(selected)
         self.assertIsNone(_journey_coverage_note(selected))
 
+    def test_selected_but_non_html_journey_link_produces_coverage_note(self):
+        """Link selected for journey but resolved non-HTML → distinct unresolved note."""
+        # Simulate: one link selected, fetch returns non-HTML (e.g. PDF), all skipped.
+        # This is the brittanychiang.com scenario.
+        selected = [{"url": "https://example.com/resume.pdf", "role": "navigation",
+                     "text": "View Full Résumé"}]
+        skipped_after_fetch = [
+            {"url": "https://example.com/resume.pdf", "role": "navigation",
+             "reason": "no usable HTML representation"},
+        ]
+        journey_cov = {"selected_links": [{"url": s["url"], "role": s["role"],
+                                           "label": s.get("text", "")} for s in selected],
+                       "crawled_links": [],
+                       "skipped_links": skipped_after_fetch}
+        skip_reasons = _journey_skip_reasons(skipped_after_fetch, selected)
+        note = (
+            f"visitor-journey: {len(selected)} link(s) were selected but none "
+            f"resolved to a usable HTML representation ({skip_reasons}); "
+            "journey coverage is limited to the target page itself."
+        )
+        report = _report("https://example.com/", RequestGovernor(spacing_seconds=0),
+                         [], ["visitor-journey"], [note], [], journey_cov)
+        # The new distinct note must appear.
+        self.assertIn(note, report["coverage"]["checks_unresolved"])
+        self.assertIn("selected but none resolved", note)
+        self.assertIn("no usable HTML representation", note)
+        # The zero-selected note must NOT appear (different cause).
+        zero_selected_note = _journey_coverage_note([])
+        self.assertNotIn(zero_selected_note, report["coverage"]["checks_unresolved"])
+        # crawled_links must remain empty.
+        self.assertEqual(report["coverage"]["journey"]["crawled_links"], [])
+        self.assertEqual(report["coverage"]["journey"]["selected_links"],
+                         [{"url": "https://example.com/resume.pdf", "role": "navigation",
+                           "label": "View Full Résumé"}])
+
+    def test_normal_html_journey_link_produces_no_coverage_note(self):
+        """A normally-fetched HTML journey link produces neither coverage note."""
+        selected = [{"url": "https://example.com/products/widget", "role": "detail",
+                     "text": "Widget"}]
+        # No skipped entries for the selected URL — it resolved to HTML.
+        journey_cov = {"selected_links": [{"url": s["url"], "role": s["role"],
+                                           "label": s.get("text", "")} for s in selected],
+                       "crawled_links": [{"url": "https://example.com/products/widget",
+                                          "role": "detail", "final_url": "https://example.com/products/widget",
+                                          "status": 200, "outcome": "ok"}],
+                       "skipped_links": []}
+        # When journey_pages is non-empty (HTML resolved), neither note fires.
+        # Verify _journey_skip_reasons handles empty skipped list gracefully.
+        skip_reasons = _journey_skip_reasons([], selected)
+        self.assertEqual(skip_reasons, "reason not recorded")
+        # And _journey_coverage_note returns None for non-empty selected.
+        self.assertIsNone(_journey_coverage_note(selected))
+        # No coverage notes in a clean report.
+        report = _report("https://example.com/", RequestGovernor(spacing_seconds=0),
+                         [], ["visitor-journey"], [], [], journey_cov)
+        journey_notes = [n for n in report["coverage"]["checks_unresolved"]
+                         if "visitor-journey" in n]
+        self.assertEqual(journey_notes, [])
+
     def test_auth_gated_journey_links_are_excluded_from_role_sampling(self):
         landing = parse_page(
             "<a href='/account/wishlist'><span>Wishlist</span></a>",
@@ -1320,6 +1422,72 @@ class RuntimeTests(unittest.TestCase):
         result = expired.fetch("https://example.com/a")
         self.assertEqual(result.outcome, "unavailable")
         self.assertEqual(expired.snapshot()["requests_started"], 0)
+
+    def test_crawl_delay_normal_is_applied_as_effective_spacing(self):
+        """A robots.txt Crawl-delay: 5 results in >=5 s spacing and crawl_delay_applied=5.0."""
+        governor = RequestGovernor(max_requests=4, max_concurrency=1, timeout=1,
+                                   max_body_bytes=1000, deadline_seconds=10, max_per_origin=4,
+                                   spacing_seconds=2.0)
+        robots_body = b"User-agent: *\nCrawl-delay: 5\nAllow: /\n"
+        def fake_request(url, *, kind, body_limit):
+            if url.endswith("/robots.txt"):
+                return Evidence(url, url, 200, {"content-type": "text/plain"},
+                                robots_body, [], "ok")
+            return Evidence(url, url, 200, {"content-type": "text/html"}, b"<p>ok</p>", [], "ok")
+        governor._request_with_retries = fake_request  # type: ignore[method-assign]
+        # Trigger robots load by fetching one URL.
+        governor.fetch("https://example.com/a")
+        origin = governor._origin(governor.normalize_url("https://example.com/a"))
+        # Effective spacing must be max(floor=2.0, declared=5.0) = 5.0.
+        self.assertEqual(governor._origin_spacing.get(origin), 5.0)
+        # robots_result must expose crawl_delay_applied.
+        result = governor.robots_result("https://example.com/a")
+        self.assertEqual(result["crawl_delay_applied"], 5.0)
+        # Spacing must never be less than same_origin_spacing_seconds (the floor).
+        self.assertGreaterEqual(result["crawl_delay_applied"], DEFAULTS.same_origin_spacing_seconds)
+
+    def test_crawl_delay_above_cap_is_capped_and_reported(self):
+        """A Crawl-delay above CRAWL_DELAY_CAP_SECONDS uses the cap value and notes it in detail."""
+        governor = RequestGovernor(max_requests=4, max_concurrency=1, timeout=1,
+                                   max_body_bytes=1000, deadline_seconds=10, max_per_origin=4,
+                                   spacing_seconds=2.0)
+        declared_value = CRAWL_DELAY_CAP_SECONDS + 90.0  # e.g. 120 s
+        robots_body = f"User-agent: *\nCrawl-delay: {declared_value:g}\nAllow: /\n".encode()
+        def fake_request(url, *, kind, body_limit):
+            if url.endswith("/robots.txt"):
+                return Evidence(url, url, 200, {"content-type": "text/plain"},
+                                robots_body, [], "ok")
+            return Evidence(url, url, 200, {"content-type": "text/html"}, b"<p>ok</p>", [], "ok")
+        governor._request_with_retries = fake_request  # type: ignore[method-assign]
+        governor.fetch("https://example.com/a")
+        origin = governor._origin(governor.normalize_url("https://example.com/a"))
+        # Effective spacing must be the cap, not the pathological declared value.
+        self.assertEqual(governor._origin_spacing.get(origin), CRAWL_DELAY_CAP_SECONDS)
+        result = governor.robots_result("https://example.com/a")
+        self.assertEqual(result["crawl_delay_applied"], CRAWL_DELAY_CAP_SECONDS)
+        # detail must mention the cap so a reader can see it was applied.
+        self.assertIn("exceeded cap", result["detail"])
+        self.assertIn(str(int(CRAWL_DELAY_CAP_SECONDS)), result["detail"])
+
+    def test_crawl_delay_absent_produces_no_crawl_delay_applied_field(self):
+        """No Crawl-delay directive: robots_result has no crawl_delay_applied, spacing is floor."""
+        governor = RequestGovernor(max_requests=4, max_concurrency=1, timeout=1,
+                                   max_body_bytes=1000, deadline_seconds=10, max_per_origin=4,
+                                   spacing_seconds=2.0)
+        robots_body = b"User-agent: *\nAllow: /\n"
+        def fake_request(url, *, kind, body_limit):
+            if url.endswith("/robots.txt"):
+                return Evidence(url, url, 200, {"content-type": "text/plain"},
+                                robots_body, [], "ok")
+            return Evidence(url, url, 200, {"content-type": "text/html"}, b"<p>ok</p>", [], "ok")
+        governor._request_with_retries = fake_request  # type: ignore[method-assign]
+        governor.fetch("https://example.com/a")
+        origin = governor._origin(governor.normalize_url("https://example.com/a"))
+        # _origin_spacing must be unset — no Crawl-delay declared.
+        self.assertNotIn(origin, governor._origin_spacing)
+        result = governor.robots_result("https://example.com/a")
+        # crawl_delay_applied must be absent from the output dict.
+        self.assertNotIn("crawl_delay_applied", result)
 
 
 class PackageTests(unittest.TestCase):
