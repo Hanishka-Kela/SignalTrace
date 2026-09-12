@@ -16,7 +16,7 @@ class Limits:
     response_body_limit_bytes: int = 2 * 1024 * 1024
     aggregate_body_limit_bytes: int = 12 * 1024 * 1024
     same_origin_spacing_seconds: float = 2.0
-    retries: int = 0
+    retries: int = 2
     global_deadline_seconds: float = 30.0
     maximum_redirects: int = 5
     robots_body_limit_bytes: int = 256 * 1024

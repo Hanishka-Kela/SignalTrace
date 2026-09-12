@@ -486,6 +486,9 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     opportunities: list[dict[str, Any]] = []
     completed, unresolved = [], []
+    source_verification_status, source_note = _source_verification_state(payload)
+    if source_note:
+        unresolved.append(source_note)
     journey_coverage: dict[str, list[dict[str, Any]]] = {
         "selected_links": [], "crawled_links": [], "skipped_links": []}
     same_as_coverage: dict[str, Any] = {
@@ -495,13 +498,15 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     except (UnsafeTarget, ValueError) as exc:
         site = requested_site
         unresolved.extend([f"robots-policy: not assessed: {exc}", "target-fetch: invalid target"])
-        return _report(site, governor, findings, completed, unresolved)
+        return _report(site, governor, findings, completed, unresolved,
+                   source_verification_status=source_verification_status)
 
     try:
         target = governor.fetch(site)
     except (LimitError, UnsafeTarget) as exc:
         unresolved.extend([f"robots-policy: not completed: {exc}", f"target-fetch: not completed: {exc}"])
-        return _report(site, governor, findings, completed, unresolved)
+        return _report(site, governor, findings, completed, unresolved,
+                   source_verification_status=source_verification_status)
 
     completed.append("robots-policy")
     if target.outcome == "robots-denied":
@@ -513,7 +518,8 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             "sameAs-identity: not assessed without permitted target evidence",
             "source-verification: not assessed because the primary target was unavailable",
         ])
-        return _report(site, governor, findings, completed, unresolved)
+        return _report(site, governor, findings, completed, unresolved,
+                   source_verification_status=source_verification_status)
     if target.outcome in {"blocked", "origin-blocked"} or target.status in {403, 429}:
         unresolved.extend([
             f"target-fetch: blocked or unavailable: {target.detail or ('HTTP ' + str(target.status))}",
@@ -523,7 +529,8 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             "sameAs-identity: not assessed without usable target HTML",
             "source-verification: primary target blocked or unavailable",
         ])
-        return _report(site, governor, findings, completed, unresolved)
+        return _report(site, governor, findings, completed, unresolved,
+                   source_verification_status=source_verification_status)
     if target.status is None:
         unresolved.extend([
             f"target-fetch: unresolved network state: {target.detail}",
@@ -533,7 +540,8 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             "sameAs-identity: not assessed without target HTML",
             "source-verification: primary target unavailable",
         ])
-        return _report(site, governor, findings, completed, unresolved)
+        return _report(site, governor, findings, completed, unresolved,
+                   source_verification_status=source_verification_status)
     completed.append("target-fetch")
     if target.status >= 400:
         if target.status in {404, 410}:
@@ -549,7 +557,8 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
                 priority=100))
         else:
             unresolved.append(f"target-fetch: HTTP {target.status}; representation checks not assessed")
-        return _report(site, governor, findings, completed, unresolved)
+        return _report(site, governor, findings, completed, unresolved,
+                   source_verification_status=source_verification_status)
     if not _is_html(target):
         unresolved.extend([
             "structured-data: target is not an HTML representation",
@@ -558,7 +567,8 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             "sameAs-identity: target is not an HTML representation",
             "source-verification: not assessed for non-HTML primary evidence",
         ])
-        return _report(site, governor, findings, completed, unresolved)
+        return _report(site, governor, findings, completed, unresolved,
+                   source_verification_status=source_verification_status)
 
     if target.outcome == "body-limit":
         unresolved.append("target-fetch: response exceeded the body limit; checks use only cached partial evidence")
@@ -684,10 +694,7 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
                 unresolved.append(f"source-verification: fetch did not complete: {exc}")
     supplied_claims = payload.get("claims", [])
     supplied_sources = payload.get("sources", [])
-    source_verification_status, dormant_note = _source_verification_state(payload)
-    if dormant_note:
-        unresolved.append(dormant_note)
-    else:
+    if supplied_claims or supplied_sources:
         found, notes = source_verification(supplied_claims, source_pages, target_url)
         findings.extend(found)
         unresolved.extend(notes)
@@ -717,6 +724,11 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
     counts = {name: sum(1 for item in findings if item["severity"] == name)
               for name in ("Critical", "High", "Medium")}
     snapshot = governor.snapshot()
+    incomplete = snapshot["response_bytes_cached"] == 0
+    audit_note = (
+        "Primary target produced zero cached response bytes after retries and fallbacks; "
+        "coverage is incomplete and no content findings were assessed."
+        if incomplete else "")
     try:
         robots_result = governor.robots_result(site)
         crawl_policy = governor.crawl_policy(site)
@@ -732,6 +744,7 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
         "summary": {
             "total_findings": len(findings),
             "critical": counts["Critical"], "high": counts["High"], "medium": counts["Medium"],
+            "audit_note": audit_note,
         },
         "coverage": {
             "requests_started": snapshot["requests_started"],
@@ -742,6 +755,7 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
             "retries_started": snapshot["retries_started"],
             "response_bytes_cached": snapshot["response_bytes_cached"],
             "elapsed_seconds": snapshot["elapsed_seconds"],
+            "audit_completeness": "incomplete" if incomplete else "assessed",
             "robots_result": robots_result,
             "crawl_policy": crawl_policy,
             "origins_stopped": snapshot["origins_stopped"],

@@ -972,6 +972,13 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(report["coverage"]["checks_unresolved"], ["fixture: not assessed"])
         self.assertNotIn("unresolved_checks", report["coverage"])
 
+    def test_zero_cached_bytes_are_reported_as_incomplete_audit(self):
+        report = _report(
+            "https://example.com/", RequestGovernor(spacing_seconds=0), [], [], [],
+            source_verification_status="not executed: optional claims/sources envelope absent")
+        self.assertEqual(report["coverage"]["audit_completeness"], "incomplete")
+        self.assertIn("zero cached response bytes", report["summary"]["audit_note"])
+
     def test_robots_denial_prevents_page_request(self):
         governor = RequestGovernor(max_requests=3, max_concurrency=1, timeout=1,
                                    max_body_bytes=1000, deadline_seconds=3, max_per_origin=3,
@@ -1033,7 +1040,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(DEFAULTS.response_body_limit_bytes, 2 * 1024 * 1024)
         self.assertEqual(DEFAULTS.aggregate_body_limit_bytes, 12 * 1024 * 1024)
         self.assertEqual(DEFAULTS.same_origin_spacing_seconds, 2)
-        self.assertEqual(DEFAULTS.retries, 0)
+        self.assertEqual(DEFAULTS.retries, 2)
         governor = RequestGovernor(spacing_seconds=0)
         context = governor.delegation_context("task-1", "https://example.com/a", ["cache:1"])
         self.assertEqual(context["maximum_additional_requests"], 0)
@@ -1046,9 +1053,59 @@ class RuntimeTests(unittest.TestCase):
         source = inspect.getsource(RequestGovernor._curl_once)
         self.assertIn("subprocess.run", source)
         for flag in ("--silent", "--show-error", "--location", "--max-time",
-                     "--connect-timeout", "--user-agent", "--compressed"):
+                     "--connect-timeout", "--user-agent", "--compressed",
+                     "--http1.1", "--fresh-connect"):
             self.assertIn(flag, source)
         self.assertEqual(USER_AGENT, "SignalTrace/1.0")
+
+    def test_http2_retries_then_uses_fallback_and_records_recovery(self):
+        governor = RequestGovernor(retries=2, spacing_seconds=0, deadline_seconds=3)
+        attempts = []
+        def fake_curl(url, *, kind, body_limit, http1_1=False, fresh_connect=False):
+            attempts.append((http1_1, fresh_connect))
+            if len(attempts) == 4:
+                return Evidence(url, url, 200, {}, b"ok", [], "ok", "")
+            return Evidence(url, url, None, {}, b"", [], "network-error", "HTTP/2", 92)
+        governor._curl_once = fake_curl  # type: ignore[method-assign]
+        result = governor._request_with_retries("https://example.com/", kind="target", body_limit=100)
+        self.assertEqual(attempts, [(False, False), (False, False), (False, False), (True, False)])
+        self.assertEqual(result.detail, "recovered via HTTP/1.1 fallback")
+
+    def test_http2_fallbacks_stop_when_deadline_expires(self):
+        governor = RequestGovernor(retries=2, spacing_seconds=0, deadline_seconds=3)
+        attempts = []
+        def fake_curl(url, *, kind, body_limit, http1_1=False, fresh_connect=False):
+            attempts.append((http1_1, fresh_connect))
+            return Evidence(url, url, None, {}, b"", [], "network-error", "HTTP/2", 92)
+        governor._curl_once = fake_curl  # type: ignore[method-assign]
+        governor.remaining_seconds = lambda: 0  # type: ignore[method-assign]
+        governor._request_with_retries("https://example.com/", kind="target", body_limit=100)
+        self.assertEqual(attempts, [(False, False)])
+
+    def test_robots_denial_never_reaches_retry_or_fallback(self):
+        governor = RequestGovernor(retries=2, spacing_seconds=0, deadline_seconds=3)
+        calls = []
+        def fake_request(url, *, kind, body_limit):
+            calls.append(url)
+            if url.endswith("/robots.txt"):
+                return Evidence(url, url, 200, {"content-type": "text/plain"},
+                                b"User-agent: *\nDisallow: /private\n", [], "ok")
+            raise AssertionError("disallowed URL reached transport")
+        governor._request_with_retries = fake_request  # type: ignore[method-assign]
+        result = governor.fetch("https://example.com/private")
+        self.assertEqual(result.outcome, "robots-denied")
+        self.assertEqual(calls, ["https://example.com/robots.txt"])
+
+    def test_robots_failure_keeps_conservative_unavailable_policy(self):
+        governor = RequestGovernor(retries=2, spacing_seconds=0, deadline_seconds=3,
+                                   max_requests=8, max_per_origin=8)
+        def fake_request(url, *, kind, body_limit):
+            return Evidence(url, url, None, {}, b"", [], "network-error", "HTTP/2", 92)
+        governor._request_with_retries = fake_request  # type: ignore[method-assign]
+        governor.fetch("https://example.com/a")
+        policy = governor.crawl_policy("https://example.com/a")
+        self.assertEqual(policy["name"], "conservative_unavailable-policy_audit")
+        self.assertIs(policy["unrestricted"], False)
 
     def test_unavailable_robots_is_reported_and_bounded_fetch_continues(self):
         governor = RequestGovernor(max_requests=3, max_concurrency=1, timeout=1,

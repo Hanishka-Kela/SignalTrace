@@ -317,7 +317,8 @@ class RequestGovernor:
             evidence.outcome = "blocked"
             evidence.detail = reason
 
-    def _curl_once(self, url: str, *, kind: str, body_limit: int) -> Evidence:
+    def _curl_once(self, url: str, *, kind: str, body_limit: int,
+                   http1_1: bool = False, fresh_connect: bool = False) -> Evidence:
         if not self._curl_path:
             return Evidence(url, url, None, {}, b"", [], "network-error", "curl executable not found")
         origin = self._origin(url)
@@ -355,6 +356,10 @@ class RequestGovernor:
                         "--dump-header", headers_path, "--output", body_path,
                         "--write-out", "%{http_code}\n%{url_effective}", url,
                     ]
+                    if http1_1:
+                        command[command.index("--compressed"):command.index("--compressed")] = ["--http1.1"]
+                    if fresh_connect:
+                        command[command.index("--compressed"):command.index("--compressed")] = ["--fresh-connect"]
                     try:
                         process = subprocess.run(
                             command, capture_output=True, text=True,
@@ -407,6 +412,15 @@ class RequestGovernor:
                 break
             retry_kind = "robots-retry" if kind.startswith("robots") else "retry"
             result = self._curl_once(url, kind=retry_kind, body_limit=body_limit)
+        if result.curl_exit == 92 and result.outcome == "network-error" and self.remaining_seconds() > 0:
+            result = self._curl_once(url, kind=kind, body_limit=body_limit, http1_1=True)
+            if result.outcome == "ok":
+                result.detail = "recovered via HTTP/1.1 fallback"
+            elif result.curl_exit == 92 and self.remaining_seconds() > 0:
+                result = self._curl_once(
+                    url, kind=kind, body_limit=body_limit, http1_1=True, fresh_connect=True)
+                if result.outcome == "ok":
+                    result.detail = "recovered via HTTP/1.1 fresh-connect fallback"
         return result
 
     def _load_robots(self, url: str) -> RobotsDecision:
