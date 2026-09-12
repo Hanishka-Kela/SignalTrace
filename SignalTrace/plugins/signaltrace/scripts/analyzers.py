@@ -1035,8 +1035,15 @@ def improvement_opportunity_audit(page: PageParser, url: str,
             confidence="certain"))
 
     parsed_nodes, _ = parsed_jsonld_nodes(page)
+    # "productgroup" is included because schema.org permits aggregateRating/review at the
+    # ProductGroup level (e.g. Shopify-style pages that group variants under one ProductGroup
+    # node). _walk_jsonld already yields the ProductGroup node; the prior omission of
+    # "productgroup" from this set was the gap. _walk_jsonld is intentionally NOT widened to
+    # recurse into hasVariant: that would affect every other check that consumes parsed_nodes
+    # (schema-minimum, sameAs, etc.) and is a broader change. Fixing the type filter here is
+    # the minimal, scoped correction.
     product_or_service_nodes = [node for _, node in parsed_nodes
-                                if _types(node).intersection({"product", "service"})]
+                                if _types(node).intersection({"product", "productgroup", "service"})]
     for node in product_or_service_nodes:
         missing = [field for field in ("aggregateRating", "review")
                if field not in node or node.get(field) in (None, "")]
@@ -1045,7 +1052,7 @@ def improvement_opportunity_audit(page: PageParser, url: str,
                 rule_id="opportunity-structured-review-signals", priority="low",
                 category="discoverability",
                 action="Add supported AggregateRating or Review properties when verified evidence exists.",
-                reason="A Product or Service JSON-LD entity was observed without one or more review signal properties.",
+                reason="A Product, ProductGroup, or Service JSON-LD entity was observed without one or more review signal properties.",
                 url=url, source=evidence_source,
                 observed={"type": node.get("@type"), "id": node.get("@id"), "missing": missing},
                 confidence="likely"))

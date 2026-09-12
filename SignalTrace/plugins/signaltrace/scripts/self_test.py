@@ -122,6 +122,52 @@ class AnalyzerTests(unittest.TestCase):
         self.assertNotIn("opportunity-organization-sameas", ids)
         self.assertNotIn("opportunity-faq-schema", ids)
 
+    def test_product_group_without_review_signals_fires_opportunity(self):
+        """ProductGroup node without aggregateRating/review fires opportunity-structured-review-signals."""
+        # Reproduces the real mokobara Shopify page structure: outer ProductGroup,
+        # hasVariant array of Product objects, no aggregateRating/review on the group node.
+        html = (
+            '<script type="application/ld+json">{'
+            '"@context": "http://schema.org/",'
+            '"@type": "ProductGroup",'
+            '"name": "Backpack Pro - 21 L",'
+            '"productGroupID": "4830271340614",'
+            '"hasVariant": ['
+            '  {"@type": "Product", "name": "Backpack Pro - Green",'
+            '   "offers": {"@type": "Offer", "price": "5499.00", "priceCurrency": "INR",'
+            '              "availability": "http://schema.org/InStock"}}'
+            ']'
+            '}</script>'
+        )
+        page = parse_page(html, "https://mokobara.com/products/test")
+        ids = {item["id"] for item in improvement_opportunity_audit(page, page.base_url)}
+        self.assertIn("opportunity-structured-review-signals", ids)
+        # Confirm the observed type in the opportunity is ProductGroup.
+        opps = [o for o in improvement_opportunity_audit(page, page.base_url)
+                if o["id"] == "opportunity-structured-review-signals"]
+        self.assertTrue(opps)
+        self.assertEqual(opps[0]["evidence"]["observed"]["type"], "ProductGroup")
+
+    def test_product_group_with_aggregate_rating_suppresses_opportunity(self):
+        """ProductGroup with aggregateRating present must NOT fire opportunity-structured-review-signals."""
+        html = (
+            '<script type="application/ld+json">{'
+            '"@context": "http://schema.org/",'
+            '"@type": "ProductGroup",'
+            '"name": "Backpack Pro - 21 L",'
+            '"aggregateRating": {"@type": "AggregateRating", "ratingValue": "4.5", "reviewCount": "120"},'
+            '"hasVariant": ['
+            '  {"@type": "Product", "name": "Backpack Pro - Green",'
+            '   "offers": {"@type": "Offer", "price": "5499.00", "priceCurrency": "INR"}}'
+            ']'
+            '}</script>'
+        )
+        page = parse_page(html, "https://mokobara.com/products/test")
+        ids = {item["id"] for item in improvement_opportunity_audit(page, page.base_url)}
+        self.assertNotIn("opportunity-structured-review-signals", ids)
+
+
+
     def test_visible_questions_without_faq_schema_get_proactive_opportunity(self):
         page = parse_page("<h2>What is Widget?</h2><p>Widget is useful.</p>"
                           "<h2>Where is Widget used?</h2><p>At home.</p>",
