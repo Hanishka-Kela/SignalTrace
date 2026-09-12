@@ -722,7 +722,7 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
     findings = _canonicalize_url_fields(findings)
     opportunities = _canonicalize_url_fields(opportunities)
     counts = {name: sum(1 for item in findings if item["severity"] == name)
-              for name in ("Critical", "High", "Medium")}
+              for name in ("critical", "high", "medium")}
     snapshot = governor.snapshot()
     incomplete = snapshot["response_bytes_cached"] == 0
     audit_note = (
@@ -743,7 +743,7 @@ def _report(site: str, governor: RequestGovernor, findings: list[dict[str, Any]]
         "audited_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "summary": {
             "total_findings": len(findings),
-            "critical": counts["Critical"], "high": counts["High"], "medium": counts["Medium"],
+            "critical": counts["critical"], "high": counts["high"], "medium": counts["medium"],
             "audit_note": audit_note,
         },
         "coverage": {

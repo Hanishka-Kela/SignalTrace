@@ -85,6 +85,9 @@ def finding(*, code: str, title: str, severity: str, confidence: float,
             priority: int, coverage_status: str = "confirmed") -> dict[str, Any]:
     affected_url = canonicalize_url(affected_url)
     evidence = _canonicalize_url_fields(evidence)
+    severity = severity.casefold()
+    if severity not in {"critical", "high", "medium"}:
+        raise ValueError(f"unsupported finding severity: {severity}")
     stable = "|".join((code, affected_url, json.dumps(evidence, sort_keys=True)))
     action_priority = ("critical" if priority >= 95 else
                        "high" if priority >= 80 else
@@ -2038,7 +2041,7 @@ def source_verification(claims: list[dict[str, Any]], source_pages: list[tuple[s
 
 
 def deduplicate_findings(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    order = {"Critical": 3, "High": 2, "Medium": 1}
+    order = {"critical": 3, "high": 2, "medium": 1}
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for item in items:
         key = (item.get("_code", item["title"]), item["affected_url"])

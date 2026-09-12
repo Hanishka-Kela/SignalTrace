@@ -107,7 +107,7 @@ class AnalyzerTests(unittest.TestCase):
                           "https://example.com")
         findings, _ = bot_directives_audit(
             page, {}, "https://example.com", {"result": "allowed", "detail": "parsed"})
-        self.assertEqual(findings[0]["severity"], "Medium")
+        self.assertEqual(findings[0]["severity"], "medium")
 
     def test_jsonld_arrays_graphs_and_exact_malformed_location(self):
         html = """<html><head>
@@ -372,7 +372,7 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(unresolved, [])
         self.assertEqual(result["classification"], "dead")
         self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0]["severity"], "High")
+        self.assertEqual(findings[0]["severity"], "high")
 
     def test_parked_same_as_is_classified_from_explicit_page_text(self):
         declaration = {"url": "https://profile.example/acme", "brand": "Acme",
@@ -385,7 +385,7 @@ class AnalyzerTests(unittest.TestCase):
             declaration, "https://acme.example/", evidence, destination)
         self.assertEqual(unresolved, [])
         self.assertEqual(result["classification"], "squatted-or-parked")
-        self.assertEqual(findings[0]["severity"], "High")
+        self.assertEqual(findings[0]["severity"], "high")
 
 
 class ImprovementOpportunityTests(unittest.TestCase):
@@ -861,7 +861,7 @@ class VisitorJourneyTests(unittest.TestCase):
         link = {"url": "https://shop.example/broken", "text": "Broken detail"}
         evidence = Evidence(link["url"], link["url"], 404, {}, b"", [], "http-error")
         findings, _ = destination_observation(link, landing.base_url, evidence, None)
-        self.assertEqual(findings[0]["severity"], "High")
+        self.assertEqual(findings[0]["severity"], "high")
 
     def test_auth_gated_journey_links_are_excluded_from_role_sampling(self):
         landing = parse_page(
@@ -914,7 +914,7 @@ class VisitorJourneyTests(unittest.TestCase):
         findings, _, _ = visitor_journey_audit(landing, landing.base_url, [{
             "role": "detail", "url": detail.base_url, "page": detail, "link": link}])
         conflict = next(item for item in findings if item["_code"] == "listing-detail-price-conflict")
-        self.assertEqual(conflict["severity"], "High")
+        self.assertEqual(conflict["severity"], "high")
         self.assertEqual(conflict["confidence"], .98)
 
     def test_vague_landing_gets_value_proposition_opportunity(self):

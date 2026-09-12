@@ -62,7 +62,7 @@ A malformed representation, HTTP failure, broken link, same-scope contradiction,
 
 ## Finding contract
 
-Every emitted finding has non-empty `id`, `title`, `severity`, `confidence`, `evidence`, `affected_url`, `evidence_type`, `responsible_party`, `impact`, `suggested_action`, `priority`, and `coverage_status`, plus `is_finding: true`. `suggested_action` is an object with non-empty `summary` and a `priority` of `critical`, `high`, `medium`, or `low`. Allowed severities are `Critical`, `High`, and `Medium`; confidence is a number from 0 through 1. Evidence should identify an exact block, property, link text, redirect hop, or extracted passage.
+Every emitted finding has non-empty `id`, `title`, `severity`, `confidence`, `evidence`, `affected_url`, `evidence_type`, `responsible_party`, `impact`, `suggested_action`, `priority`, and `coverage_status`, plus `is_finding: true`. `suggested_action` is an object with non-empty `summary` and a `priority` of `critical`, `high`, `medium`, or `low`. Allowed finding severities are lowercase `critical`, `high`, and `medium`; confidence is a number from 0 through 1. Evidence should identify an exact block, property, link text, redirect hop, or extracted passage.
 
 Deduplicate by normalized affected URL plus underlying defect and scope. When one missing qualification appears in a table, summary, and passage, merge those observations into one finding. Keep the strongest directly supported severity and combine distinct evidence.
 
