@@ -339,6 +339,27 @@ class ImprovementOpportunityTests(unittest.TestCase):
         self.assertEqual(len(merged), 2)
         self.assertEqual({item["id"] for item in merged}, {
             "opportunity-control-labels", "opportunity-navigation-labels"})
+
+    def test_tracking_and_clean_page_variants_merge_once_without_double_counting(self):
+        clean = opportunity(
+            rule_id="opportunity-control-labels", priority="high", category="engagement",
+            action="Expose a programmatic label.", reason="No static name was observed.",
+            url="https://example.com/", source="initial HTML",
+            observed=[{"tag": "button", "occurrence_count": 7}], confidence="certain")
+        tracked = opportunity(
+            rule_id="opportunity-control-labels", priority="high", category="engagement",
+            action="Expose a programmatic label.", reason="No static name was observed.",
+            url="https://example.com/?srsltid=tracking-token", source="initial HTML",
+            observed=[{"tag": "button", "occurrence_count": 9}], confidence="certain")
+        for item in (clean, tracked):
+            item["evidence"]["check_performed"] = "opportunity-control-labels"
+        merged = _consolidate_opportunities([tracked, clean], "https://example.com/?srsltid=tracking-token")
+        self.assertEqual(len(merged), 1)
+        pages = merged[0]["evidence"]["observed"]
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0]["url"], "https://example.com/")
+        self.assertEqual(pages[0]["observed"][0]["occurrence_count"], 9)
+        self.assertEqual(pages[0]["occurrence_count"], 9)
     def test_missing_structured_data_is_opportunity_not_finding(self):
         page = parse_page("<html><head><title>About</title></head><body><h1>About</h1><p>Useful answer.</p></body></html>",
                           "https://example.com/")

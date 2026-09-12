@@ -17,7 +17,7 @@ from analyzers import (
     classify_link, deduplicate_opportunities, destination_observation, finding,
     improvement_opportunity_audit, opportunity, parse_page, source_verification, structured_data_audit,
     same_as_declarations, same_as_destination_observation, visitor_journey_audit,
-    _canonicalize_url_fields,
+    _canonicalize_url_fields, canonicalize_url,
 )
 from runtime import Evidence, LimitError, RequestGovernor, UnsafeTarget
 from config import DEFAULTS
@@ -99,8 +99,8 @@ def _consolidate_opportunities(items: list[dict[str, Any]], site: str) -> list[d
     priority_order = {"high": 0, "medium": 1, "low": 2}
     for key in sorted(grouped):
         group = grouped[key]
-        urls = {item.get("evidence", {}).get("url", "") for item in group}
-        if len(group) < 2 or len(urls) < 2:
+        urls = {canonicalize_url(item.get("evidence", {}).get("url", "")) for item in group}
+        if len(group) < 2:
             consolidated.extend(group)
             continue
         family = key[0]
@@ -109,25 +109,46 @@ def _consolidate_opportunities(items: list[dict[str, Any]], site: str) -> list[d
         merged = dict(representative)
         merged["id"] = family
         merged.pop("page_role", None)
-        pages = []
+        pages_by_url: dict[str, dict[str, Any]] = {}
         for item in sorted(group, key=lambda value: (
-                value.get("evidence", {}).get("url", ""), value.get("id", ""))):
+                canonicalize_url(value.get("evidence", {}).get("url", "")),
+                value.get("id", ""))):
             evidence = item["evidence"]
+            page_url = canonicalize_url(evidence.get("url", ""))
             observed = evidence.get("observed")
-            if isinstance(observed, list):
-                occurrence_count = sum(
-                    entry.get("occurrence_count", 1) if isinstance(entry, dict) else 1
-                    for entry in observed)
-            else:
-                occurrence_count = 1
-            pages.append({
-                "url": evidence.get("url", ""),
-                "source": evidence.get("source", ""),
-                "observed": observed,
-                "occurrence_count": occurrence_count,
+            page = pages_by_url.setdefault(page_url, {
+                "url": page_url, "source": evidence.get("source", ""),
+                "observed": [], "occurrence_count": 0,
             })
+            observations = observed if isinstance(observed, list) else [observed]
+            def observation_key(value: Any) -> str:
+                if isinstance(value, dict):
+                    value = {key: item for key, item in value.items()
+                             if key != "occurrence_count"}
+                return json.dumps(value, sort_keys=True, separators=(",", ":"))
+            by_observation = {
+                observation_key(value): value
+                for value in page["observed"]
+            }
+            for value in observations:
+                if value is None:
+                    continue
+                marker = observation_key(value)
+                prior = by_observation.get(marker)
+                if isinstance(value, dict) and isinstance(prior, dict):
+                    prior_count = int(prior.get("occurrence_count", 1))
+                    value_count = int(value.get("occurrence_count", 1))
+                    prior["occurrence_count"] = max(prior_count, value_count)
+                elif prior is None:
+                    by_observation[marker] = value
+            page["observed"] = [by_observation[key] for key in sorted(by_observation)]
+            page["occurrence_count"] = max(
+                page["occurrence_count"],
+                sum(int(value.get("occurrence_count", 1)) if isinstance(value, dict) else 1
+                    for value in observations if value is not None))
+        pages = list(pages_by_url.values())
         merged["evidence"] = {
-            "url": site,
+            "url": canonicalize_url(site),
             "source": representative["evidence"].get("source", ""),
             "observed": pages,
             "check_performed": family,
@@ -228,7 +249,7 @@ def _select_journey_links(page, target_url: str, limit: int) -> tuple[list[dict[
         if parts.scheme not in {"http", "https"}:
             skipped.append({"url": link.get("url", ""), "reason": "unsupported scheme"})
             continue
-        url = urllib.parse.urldefrag(link["url"])[0]
+        url = canonicalize_url(urllib.parse.urldefrag(link["url"])[0])
         if url == target_without_fragment:
             skipped.append({"url": url, "reason": "same-page or target URL"})
             continue
@@ -303,7 +324,7 @@ def _explicit_citations(payload: dict[str, Any], base: str) -> list[dict[str, st
             item = {"url": item}
         if not isinstance(item, dict) or not item.get("url"):
             continue
-        url = urllib.parse.urljoin(base, str(item["url"]))
+        url = canonicalize_url(urllib.parse.urljoin(base, str(item["url"])))
         party = item.get("responsible_party", "assistant-generated citation")
         if party not in {"site-published link", "external publisher", "assistant-generated citation", "unresolved"}:
             party = "unresolved"
@@ -383,7 +404,7 @@ def _fetch_journey(governor: RequestGovernor, source_url: str,
             f"visitor-journey: {link['url']} exceeded the body limit; partial evidence only")
     page = parse_page(evidence.text(), evidence.final_url) if _is_html(evidence) else None
     record["page"] = page
-    record["url"] = evidence.final_url
+    record["url"] = canonicalize_url(evidence.final_url)
     found, notes = destination_observation(link, source_url, evidence, page)
     for item in found:
         item["responsible_party"] = "site-published link"
@@ -514,8 +535,9 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     if target.outcome == "body-limit":
         unresolved.append("target-fetch: response exceeded the body limit; checks use only cached partial evidence")
 
-    page = parse_page(target.text(), target.final_url)
-    same_as_items, same_as_notes, same_as_applicability = same_as_declarations(page, target.final_url)
+    target_url = canonicalize_url(target.final_url)
+    page = parse_page(target.text(), target_url)
+    same_as_items, same_as_notes, same_as_applicability = same_as_declarations(page, target_url)
     same_as_coverage["declared"] = len(same_as_items)
     same_as_coverage["status"] = same_as_applicability
     unresolved.extend(same_as_notes)
@@ -526,9 +548,9 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
         unresolved.append(
             f"robots-policy: {robots_result.get('result')}: {robots_result.get('detail')}; "
             "only the governor's permitted bounded behavior can continue")
-    citations = _explicit_citations(payload, target.final_url)[:max(0, args.max_link_checks)]
+    citations = _explicit_citations(payload, target_url)[:max(0, args.max_link_checks)]
     journey_limit = _journey_sample_limit(robots_result, args.max_link_checks)
-    journey_links, skipped_links = _select_journey_links(page, target.final_url, journey_limit)
+    journey_links, skipped_links = _select_journey_links(page, target_url, journey_limit)
     journey_coverage["selected_links"] = [
         {"url": item["url"], "role": item.get("role", "other"),
          "label": item.get("text", "")} for item in journey_links]
@@ -542,16 +564,16 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     # Local parsing begins in parallel with independent, bounded network evidence tasks.
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(args.max_concurrency, 10))) as pool:
         local_futures = {
-            pool.submit(bot_directives_audit, page, target.headers, target.final_url, robots_result): "bot-directives",
-            pool.submit(structured_data_audit, page, target.final_url): "structured-data",
-            pool.submit(content_engagement_audit, page, target.final_url): "content-engagement",
+            pool.submit(bot_directives_audit, page, target.headers, target_url, robots_result): "bot-directives",
+            pool.submit(structured_data_audit, page, target_url): "structured-data",
+            pool.submit(content_engagement_audit, page, target_url): "content-engagement",
         }
-        opportunity_future = pool.submit(improvement_opportunity_audit, page, target.final_url)
-        journey_futures = [pool.submit(_fetch_journey, governor, target.final_url, link)
+        opportunity_future = pool.submit(improvement_opportunity_audit, page, target_url)
+        journey_futures = [pool.submit(_fetch_journey, governor, target_url, link)
                            for link in journey_links]
-        destination_futures = [pool.submit(_audit_destination, governor, target.final_url, link)
+        destination_futures = [pool.submit(_audit_destination, governor, target_url, link)
                                for link in citations if link["url"] not in {item["url"] for item in journey_links}]
-        same_as_futures = [pool.submit(_audit_same_as, governor, target.final_url, item)
+        same_as_futures = [pool.submit(_audit_same_as, governor, target_url, item)
                            for item in same_as_items]
         source_futures = [pool.submit(_fetch_source, governor, url) for url in sources]
         for future, name in local_futures.items():
@@ -587,7 +609,7 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
             except Exception as exc:
                 unresolved.append(f"visitor-journey: check did not complete: {exc}")
         try:
-            found, suggested, notes = visitor_journey_audit(page, target.final_url, journey_pages)
+            found, suggested, notes = visitor_journey_audit(page, target_url, journey_pages)
             findings.extend(found)
             opportunities.extend(suggested)
             unresolved.extend(notes)
@@ -632,7 +654,7 @@ def run(payload: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
                     unresolved.append(note)
             except Exception as exc:
                 unresolved.append(f"source-verification: fetch did not complete: {exc}")
-    found, notes = source_verification(payload.get("claims", []), source_pages, target.final_url)
+    found, notes = source_verification(payload.get("claims", []), source_pages, target_url)
     findings.extend(found)
     unresolved.extend(notes)
     completed.append("source-verification")

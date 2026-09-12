@@ -21,7 +21,7 @@ def compact(value: str, limit: int = 280) -> str:
 
 _TRACKING_PARAMETER_NAMES = {
     "gclid", "gad_source", "gad_campaignid", "gbraid", "clickid", "fbclid",
-    "dclid", "msclkid", "twclid", "mc_cid", "mc_eid", "campaign_id",
+    "dclid", "msclkid", "twclid", "mc_cid", "mc_eid", "srsltid", "campaign_id",
     "deep_link_value", "is_retargeting", "pid", "c", "host_internal",
     "product_name", "storecontext",
 }
